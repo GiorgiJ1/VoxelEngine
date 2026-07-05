@@ -1,0 +1,12 @@
+[package]
+name = "voxel_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+voxel_core = { path = "../voxel_core" }
+wgpu = "22"
+winit = "0.30"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"

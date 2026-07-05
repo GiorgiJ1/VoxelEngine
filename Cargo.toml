@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["voxel_core", "voxel_viewer"]
