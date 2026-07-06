@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use voxel_core::{greedy_mesh, Chunk, MeshData, Voxel};
+use voxel_core::{greedy_mesh, raycast_chunk, Chunk, MeshData, Voxel, CHUNK_SIZE};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -40,8 +41,7 @@ struct Uniforms {
 }
 
 /// Mouse-controlled orbit camera: left-drag rotates around `target`,
-/// scroll zooms in/out. This is the standard "look at a 3D model" camera
-/// you'd want for an asset editor, as opposed to a first-person flycam.
+/// scroll zooms in/out.
 struct Camera {
     target: Vec3,
     yaw: f32,
@@ -63,12 +63,9 @@ impl Camera {
         proj * view
     }
 
-    /// dx/dy are raw cursor-movement deltas in pixels while dragging.
     fn orbit(&mut self, dx: f32, dy: f32) {
         const SENSITIVITY: f32 = 0.005;
         self.yaw -= dx * SENSITIVITY;
-        // Clamp pitch just short of straight up/down so the view never
-        // flips upside down when you drag past the pole.
         self.pitch = (self.pitch + dy * SENSITIVITY).clamp(-1.5, 1.5);
     }
 
@@ -81,7 +78,7 @@ impl Camera {
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            target: Vec3::new(2.0, 1.5, 2.0), // roughly the center of the demo shape
+            target: Vec3::new(2.0, 1.5, 2.0),
             yaw: 45f32.to_radians(),
             pitch: 30f32.to_radians(),
             distance: 10.0,
@@ -89,21 +86,15 @@ impl Default for Camera {
     }
 }
 
-/// Placeholder palette: voxel id -> RGB. This will eventually be a real,
-/// artist-editable palette; for now it's just enough to prove multiple
-/// materials render distinctly.
 fn palette(id: u16) -> [f32; 3] {
     match id {
-        1 => [0.30, 0.75, 0.35], // green "grass" base
-        2 => [0.80, 0.45, 0.20], // orange "wood" pillar
-        3 => [0.85, 0.15, 0.15], // red "roof" cap
+        1 => [0.30, 0.75, 0.35],
+        2 => [0.80, 0.45, 0.20],
+        3 => [0.85, 0.15, 0.15],
         _ => [0.6, 0.6, 0.6],
     }
 }
 
-/// Builds a tiny demo shape: a 4x4 green platform, a single orange pillar,
-/// and a red cap on top -- enough to show greedy-merged flat faces AND
-/// multiple materials in one mesh.
 fn build_demo_chunk() -> Chunk {
     let mut chunk = Chunk::empty();
     for x in 0..4 {
@@ -148,8 +139,12 @@ struct Gpu {
     bind_group: wgpu::BindGroup,
     window: Arc<Window>,
     camera: Camera,
+    chunk: Chunk,
+    current_material: u16,
     dragging: bool,
-    last_cursor: Option<(f64, f64)>,
+    cursor_pos: (f64, f64),
+    drag_last: Option<(f64, f64)>,
+    press_pos: Option<(f64, f64)>,
 }
 
 fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
@@ -325,8 +320,12 @@ impl Gpu {
             bind_group,
             window,
             camera: Camera::default(),
+            chunk,
+            current_material: 1,
             dragging: false,
-            last_cursor: None,
+            cursor_pos: (0.0, 0.0),
+            drag_last: None,
+            press_pos: None,
         }
     }
 
@@ -351,24 +350,47 @@ impl Gpu {
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
+    const CLICK_MOVE_THRESHOLD: f64 = 4.0;
+
     fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
-        if button == MouseButton::Left {
-            self.dragging = state == ElementState::Pressed;
-            if !self.dragging {
-                self.last_cursor = None;
+        match button {
+            MouseButton::Left => {
+                if state == ElementState::Pressed {
+                    self.dragging = true;
+                    self.drag_last = Some(self.cursor_pos);
+                    self.press_pos = Some(self.cursor_pos);
+                } else {
+                    self.dragging = false;
+                    self.drag_last = None;
+                    if let Some(press) = self.press_pos.take() {
+                        let moved = ((self.cursor_pos.0 - press.0).powi(2)
+                            + (self.cursor_pos.1 - press.1).powi(2))
+                        .sqrt();
+                        if moved < Self::CLICK_MOVE_THRESHOLD {
+                            self.try_add_voxel(self.cursor_pos.0, self.cursor_pos.1);
+                        }
+                    }
+                }
             }
+            MouseButton::Right => {
+                if state == ElementState::Released {
+                    self.try_remove_voxel(self.cursor_pos.0, self.cursor_pos.1);
+                }
+            }
+            _ => {}
         }
     }
 
     fn handle_cursor_moved(&mut self, x: f64, y: f64) {
+        self.cursor_pos = (x, y);
         if self.dragging {
-            if let Some((last_x, last_y)) = self.last_cursor {
+            if let Some((last_x, last_y)) = self.drag_last {
                 let dx = (x - last_x) as f32;
                 let dy = (y - last_y) as f32;
                 self.camera.orbit(dx, dy);
             }
+            self.drag_last = Some((x, y));
         }
-        self.last_cursor = Some((x, y));
     }
 
     fn handle_scroll(&mut self, delta: MouseScrollDelta) {
@@ -377,6 +399,72 @@ impl Gpu {
             MouseScrollDelta::PixelDelta(pos) => (pos.y / 100.0) as f32,
         };
         self.camera.zoom(amount);
+    }
+
+    fn set_material(&mut self, id: u16) {
+        self.current_material = id;
+        println!("current material: {id}");
+    }
+
+    fn cursor_ray(&self, x: f64, y: f64) -> (Vec3, Vec3) {
+        let width = self.config.width as f32;
+        let height = self.config.height.max(1) as f32;
+        let ndc_x = (2.0 * x as f32 / width) - 1.0;
+        let ndc_y = 1.0 - (2.0 * y as f32 / height);
+
+        let aspect = width / height;
+        let inv_vp = self.camera.view_proj(aspect).inverse();
+
+        let near = inv_vp * Vec4::new(ndc_x, ndc_y, -1.0, 1.0);
+        let far = inv_vp * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+        let near_world = near.truncate() / near.w;
+        let far_world = far.truncate() / far.w;
+
+        (near_world, (far_world - near_world).normalize())
+    }
+
+    fn try_add_voxel(&mut self, x: f64, y: f64) {
+        let (origin, dir) = self.cursor_ray(x, y);
+        let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
+        let Some(place) = hit.place_at else { return };
+
+        let size = CHUNK_SIZE as i32;
+        if place.x < 0 || place.y < 0 || place.z < 0 || place.x >= size || place.y >= size || place.z >= size {
+            return;
+        }
+
+        self.chunk.set(
+            place.x as usize,
+            place.y as usize,
+            place.z as usize,
+            Voxel::new(self.current_material),
+        );
+        self.rebuild_mesh();
+    }
+
+    fn try_remove_voxel(&mut self, x: f64, y: f64) {
+        let (origin, dir) = self.cursor_ray(x, y);
+        let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
+        self.chunk
+            .set(hit.voxel.x as usize, hit.voxel.y as usize, hit.voxel.z as usize, Voxel::EMPTY);
+        self.rebuild_mesh();
+    }
+
+    fn rebuild_mesh(&mut self) {
+        let mesh = greedy_mesh(&self.chunk);
+        let vertices = mesh_to_vertices(&mesh);
+
+        self.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vertex_buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        self.index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("index_buffer"),
+            contents: bytemuck::cast_slice(&mesh.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.num_indices = mesh.indices.len() as u32;
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -442,6 +530,18 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { button, state, .. } => gpu.handle_mouse_button(button, state),
             WindowEvent::CursorMoved { position, .. } => gpu.handle_cursor_moved(position.x, position.y),
             WindowEvent::MouseWheel { delta, .. } => gpu.handle_scroll(delta),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        match code {
+                            KeyCode::Digit1 => gpu.set_material(1),
+                            KeyCode::Digit2 => gpu.set_material(2),
+                            KeyCode::Digit3 => gpu.set_material(3),
+                            _ => {}
+                        }
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 match gpu.render() {
                     Ok(()) => {}
