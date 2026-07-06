@@ -11,6 +11,9 @@ use winit::window::{Window, WindowId};
 
 use voxel_core::{greedy_mesh, raycast_chunk, Chunk, MeshData, Voxel, CHUNK_SIZE};
 
+use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
+use egui_winit::State as EguiState;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
@@ -41,7 +44,8 @@ struct Uniforms {
 }
 
 /// Mouse-controlled orbit camera: left-drag rotates around `target`,
-/// scroll zooms in/out.
+/// scroll zooms in/out. This is the standard "look at a 3D model" camera
+/// you'd want for an asset editor, as opposed to a first-person flycam.
 struct Camera {
     target: Vec3,
     yaw: f32,
@@ -63,9 +67,12 @@ impl Camera {
         proj * view
     }
 
+    /// dx/dy are raw cursor-movement deltas in pixels while dragging.
     fn orbit(&mut self, dx: f32, dy: f32) {
         const SENSITIVITY: f32 = 0.005;
         self.yaw -= dx * SENSITIVITY;
+        // Clamp pitch just short of straight up/down so the view never
+        // flips upside down when you drag past the pole.
         self.pitch = (self.pitch + dy * SENSITIVITY).clamp(-1.5, 1.5);
     }
 
@@ -78,7 +85,7 @@ impl Camera {
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            target: Vec3::new(2.0, 1.5, 2.0),
+            target: Vec3::new(2.0, 1.5, 2.0), // roughly the center of the demo shape
             yaw: 45f32.to_radians(),
             pitch: 30f32.to_radians(),
             distance: 10.0,
@@ -86,42 +93,70 @@ impl Default for Camera {
     }
 }
 
-fn palette(id: u16) -> [f32; 3] {
-    match id {
-        1 => [0.30, 0.75, 0.35],
-        2 => [0.80, 0.45, 0.20],
-        3 => [0.85, 0.15, 0.15],
-        _ => [0.6, 0.6, 0.6],
-    }
+/// A single entry in the artist's palette: an id (what gets stored per
+/// voxel), a display name, and an RGB swatch color. This replaces the old
+/// hardcoded match-statement palette so the UI can list, add, and select
+/// materials instead of them being fixed in code.
+/// Need to configure material use !
+#[derive(Clone)]
+struct Material {
+    id: u16,
+    name: &'static str,
+    color: [f32; 3],
 }
 
+/// Starting palette, matching the mockup's default 8 materials.
+fn default_materials() -> Vec<Material> {
+    vec![
+        Material { id: 1, name: "White", color: [0.93, 0.93, 0.94] },
+        Material { id: 2, name: "Coral", color: [0.92, 0.38, 0.38] },
+        Material { id: 3, name: "Sun", color: [0.95, 0.80, 0.25] },
+        Material { id: 4, name: "Leaf", color: [0.35, 0.75, 0.40] },
+        Material { id: 5, name: "Sky", color: [0.30, 0.55, 0.90] },
+        Material { id: 6, name: "Grape", color: [0.58, 0.38, 0.85] },
+        Material { id: 7, name: "Charcoal", color: [0.28, 0.28, 0.31] },
+        Material { id: 8, name: "Rust", color: [0.75, 0.42, 0.22] },
+    ]
+}
+
+fn material_color(materials: &[Material], id: u16) -> [f32; 3] {
+    materials
+        .iter()
+        .find(|m| m.id == id)
+        .map(|m| m.color)
+        .unwrap_or([0.6, 0.6, 0.6])
+}
+
+/// Builds a tiny demo shape: a 4x4 "Leaf" platform, a "Rust" pillar,
+/// and a "Coral" cap on top -- enough to show greedy-merged flat faces AND
+/// multiple materials in one mesh.
 fn build_demo_chunk() -> Chunk {
     let mut chunk = Chunk::empty();
     for x in 0..4 {
         for z in 0..4 {
-            chunk.set(x, 0, z, Voxel::new(1));
+            chunk.set(x, 0, z, Voxel::new(4)); // Leaf
         }
     }
     for y in 1..4 {
-        chunk.set(1, y, 1, Voxel::new(2));
-        chunk.set(2, y, 1, Voxel::new(2));
-        chunk.set(1, y, 2, Voxel::new(2));
-        chunk.set(2, y, 2, Voxel::new(2));
+        chunk.set(1, y, 1, Voxel::new(8)); // Rust
+        chunk.set(2, y, 1, Voxel::new(8));
+        chunk.set(1, y, 2, Voxel::new(8));
+        chunk.set(2, y, 2, Voxel::new(8));
     }
     for x in 0..3 {
         for z in 0..3 {
-            chunk.set(x, 4, z, Voxel::new(3));
+            chunk.set(x, 4, z, Voxel::new(2)); // Coral
         }
     }
     chunk
 }
 
-fn mesh_to_vertices(mesh: &MeshData) -> Vec<Vertex> {
+fn mesh_to_vertices(mesh: &MeshData, materials: &[Material]) -> Vec<Vertex> {
     mesh.positions
         .iter()
         .zip(mesh.normals.iter())
         .zip(mesh.voxel_ids.iter())
-        .map(|((p, n), id)| Vertex { position: *p, normal: *n, color: palette(*id) })
+        .map(|((p, n), id)| Vertex { position: *p, normal: *n, color: material_color(materials, *id) })
         .collect()
 }
 
@@ -140,11 +175,15 @@ struct Gpu {
     window: Arc<Window>,
     camera: Camera,
     chunk: Chunk,
+    materials: Vec<Material>,
     current_material: u16,
     dragging: bool,
     cursor_pos: (f64, f64),
     drag_last: Option<(f64, f64)>,
     press_pos: Option<(f64, f64)>,
+    egui_ctx: egui::Context,
+    egui_state: EguiState,
+    egui_renderer: EguiRenderer,
 }
 
 fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
@@ -285,8 +324,9 @@ impl Gpu {
         });
 
         let chunk = build_demo_chunk();
+        let materials = default_materials();
         let mesh = greedy_mesh(&chunk);
-        let vertices = mesh_to_vertices(&mesh);
+        let vertices = mesh_to_vertices(&mesh, &materials);
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex_buffer"),
@@ -306,6 +346,17 @@ impl Gpu {
             mesh.triangle_count()
         );
 
+        let egui_ctx = egui::Context::default();
+        let egui_state = EguiState::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        let egui_renderer = EguiRenderer::new(&device, config.format, None, 1, false);
+
         Self {
             surface,
             device,
@@ -321,11 +372,15 @@ impl Gpu {
             window,
             camera: Camera::default(),
             chunk,
-            current_material: 1,
+            materials,
+            current_material: 5, // "Sky", matching the mockup's default selection
             dragging: false,
             cursor_pos: (0.0, 0.0),
             drag_last: None,
             press_pos: None,
+            egui_ctx,
+            egui_state,
+            egui_renderer,
         }
     }
 
@@ -350,6 +405,8 @@ impl Gpu {
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
+    /// Small movement threshold (in pixels) below which a press+release is
+    /// treated as a "click" (place a voxel) rather than a camera drag.
     const CLICK_MOVE_THRESHOLD: f64 = 4.0;
 
     fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
@@ -406,6 +463,10 @@ impl Gpu {
         println!("current material: {id}");
     }
 
+    /// Unprojects a screen-space cursor position into a world-space ray,
+    /// using the inverse of the exact view-proj matrix the camera renders
+    /// with -- so the ray always matches what's on screen, regardless of
+    /// window size or camera position.
     fn cursor_ray(&self, x: f64, y: f64) -> (Vec3, Vec3) {
         let width = self.config.width as f32;
         let height = self.config.height.max(1) as f32;
@@ -430,7 +491,7 @@ impl Gpu {
 
         let size = CHUNK_SIZE as i32;
         if place.x < 0 || place.y < 0 || place.z < 0 || place.x >= size || place.y >= size || place.z >= size {
-            return;
+            return; // would be outside this chunk -- multi-chunk placement comes later
         }
 
         self.chunk.set(
@@ -450,9 +511,14 @@ impl Gpu {
         self.rebuild_mesh();
     }
 
+    /// Re-runs the greedy mesher and re-uploads the vertex/index buffers.
+    /// Simple approach for v1: rebuild both buffers from scratch on every
+    /// edit rather than trying to patch them in place. Fine for
+    /// single-chunk, interactive editing; we'll optimize if it ever
+    /// becomes a bottleneck on bigger scenes.
     fn rebuild_mesh(&mut self) {
         let mesh = greedy_mesh(&self.chunk);
-        let vertices = mesh_to_vertices(&mesh);
+        let vertices = mesh_to_vertices(&mesh, &self.materials);
 
         self.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex_buffer"),
@@ -501,6 +567,80 @@ impl Gpu {
             pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
+        // --- egui overlay: materials panel ---
+        let raw_input = self.egui_state.take_egui_input(&*self.window);
+        let materials = self.materials.clone();
+        let mut selected = self.current_material;
+
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            egui::SidePanel::right("materials_panel")
+                .resizable(false)
+                .default_width(220.0)
+                .show(ctx, |ui| {
+                    ui.heading("Materials");
+                    ui.separator();
+                    for m in &materials {
+                        let is_selected = m.id == selected;
+                        let swatch = egui::Color32::from_rgb(
+                            (m.color[0] * 255.0) as u8,
+                            (m.color[1] * 255.0) as u8,
+                            (m.color[2] * 255.0) as u8,
+                        );
+                        ui.horizontal(|ui| {
+                            let (rect, swatch_response) =
+                                ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                            ui.painter().rect_filled(rect, 3.0, swatch);
+                            let label_response =
+                                ui.selectable_label(is_selected, format!("{}  #{:02}", m.name, m.id));
+                            if swatch_response.clicked() || label_response.clicked() {
+                                selected = m.id;
+                            }
+                        });
+                    }
+                    ui.separator();
+                    let name = materials.iter().find(|m| m.id == selected).map(|m| m.name).unwrap_or("?");
+                    ui.label(format!("Selected material: {name}"));
+                });
+        });
+        self.current_material = selected;
+
+        self.egui_state.handle_platform_output(&*self.window, full_output.platform_output);
+        let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: self.window.scale_factor() as f32,
+        };
+        self.egui_renderer
+            .update_buffers(&self.device, &self.queue, &mut encoder, &clipped_primitives, &screen_descriptor);
+
+        {
+            let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            // egui-wgpu's renderer wants a render pass decoupled from the
+            // encoder's borrow lifetime; forget_lifetime() is the standard
+            // way to hand it one.
+            let mut egui_pass = egui_pass.forget_lifetime();
+            self.egui_renderer.render(&mut egui_pass, &clipped_primitives, &screen_descriptor);
+        }
+
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
         Ok(())
@@ -524,14 +664,29 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(gpu) = &mut self.gpu else { return };
+
+        let response = gpu.egui_state.on_window_event(&*gpu.window, &event);
+        if response.repaint {
+            gpu.window.request_redraw();
+        }
+        let consumed_by_ui = response.consumed;
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
-            WindowEvent::MouseInput { button, state, .. } => gpu.handle_mouse_button(button, state),
+            WindowEvent::MouseInput { button, state, .. } => {
+                if !consumed_by_ui {
+                    gpu.handle_mouse_button(button, state);
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => gpu.handle_cursor_moved(position.x, position.y),
-            WindowEvent::MouseWheel { delta, .. } => gpu.handle_scroll(delta),
+            WindowEvent::MouseWheel { delta, .. } => {
+                if !consumed_by_ui {
+                    gpu.handle_scroll(delta);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
+                if !consumed_by_ui && event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         match code {
                             KeyCode::Digit1 => gpu.set_material(1),
