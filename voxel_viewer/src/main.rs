@@ -6,10 +6,10 @@ use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use voxel_core::{greedy_mesh, raycast_chunk, Chunk, MeshData, Voxel, CHUNK_SIZE};
+use voxel_core::{greedy_mesh, load_chunk, raycast_chunk, save_chunk, Chunk, MeshData, Voxel, CHUNK_SIZE};
 
 use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
 use egui_winit::State as EguiState;
@@ -71,8 +71,6 @@ impl Camera {
     fn orbit(&mut self, dx: f32, dy: f32) {
         const SENSITIVITY: f32 = 0.005;
         self.yaw -= dx * SENSITIVITY;
-        // Clamp pitch just short of straight up/down so the view never
-        // flips upside down when you drag past the pole.
         self.pitch = (self.pitch + dy * SENSITIVITY).clamp(-1.5, 1.5);
     }
 
@@ -85,7 +83,7 @@ impl Camera {
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            target: Vec3::new(2.0, 1.5, 2.0), // roughly the center of the demo shape
+            target: Vec3::new(2.0, 1.5, 2.0),
             yaw: 45f32.to_radians(),
             pitch: 30f32.to_radians(),
             distance: 10.0,
@@ -93,11 +91,17 @@ impl Default for Camera {
     }
 }
 
+/// Which effect a left-click has, matching the mockup's "Paint Mode" radio
+/// group. Right-click stays a quick-remove shortcut regardless of mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaintMode {
+    Add,
+    Replace,
+    Remove,
+}
+
 /// A single entry in the artist's palette: an id (what gets stored per
-/// voxel), a display name, and an RGB swatch color. This replaces the old
-/// hardcoded match-statement palette so the UI can list, add, and select
-/// materials instead of them being fixed in code.
-/// Need to configure material use !
+/// voxel), a display name, and an RGB swatch color.
 #[derive(Clone)]
 struct Material {
     id: u16,
@@ -128,8 +132,7 @@ fn material_color(materials: &[Material], id: u16) -> [f32; 3] {
 }
 
 /// Builds a tiny demo shape: a 4x4 "Leaf" platform, a "Rust" pillar,
-/// and a "Coral" cap on top -- enough to show greedy-merged flat faces AND
-/// multiple materials in one mesh.
+/// and a "Coral" cap on top -- used only when there's no save file yet.
 fn build_demo_chunk() -> Chunk {
     let mut chunk = Chunk::empty();
     for x in 0..4 {
@@ -177,10 +180,12 @@ struct Gpu {
     chunk: Chunk,
     materials: Vec<Material>,
     current_material: u16,
+    paint_mode: PaintMode,
     dragging: bool,
     cursor_pos: (f64, f64),
     drag_last: Option<(f64, f64)>,
     press_pos: Option<(f64, f64)>,
+    modifiers: ModifiersState,
     egui_ctx: egui::Context,
     egui_state: EguiState,
     egui_renderer: EguiRenderer,
@@ -201,6 +206,18 @@ fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration)
 }
 
 impl Gpu {
+    /// v1 keeps this dead simple: one fixed save file next to the
+    /// executable. Multi-file project management (New/Open/Save As) comes
+    /// once there's more than a single chunk worth saving.
+    const SAVE_PATH: &'static str = "voxel_save.bin";
+
+    fn save(&self) {
+        match save_chunk(&self.chunk, std::path::Path::new(Self::SAVE_PATH)) {
+            Ok(()) => println!("saved to {}", Self::SAVE_PATH),
+            Err(e) => eprintln!("save failed: {e}"),
+        }
+    }
+
     fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
 
@@ -323,7 +340,16 @@ impl Gpu {
             cache: None,
         });
 
-        let chunk = build_demo_chunk();
+        let chunk = match load_chunk(std::path::Path::new(Gpu::SAVE_PATH)) {
+            Ok(c) => {
+                println!("loaded existing save from {}", Gpu::SAVE_PATH);
+                c
+            }
+            Err(e) => {
+                println!("no usable save file ({e}) -- starting from the demo shape");
+                build_demo_chunk()
+            }
+        };
         let materials = default_materials();
         let mesh = greedy_mesh(&chunk);
         let vertices = mesh_to_vertices(&mesh, &materials);
@@ -340,7 +366,7 @@ impl Gpu {
         });
 
         println!(
-            "loaded demo mesh: {} quads, {} verts, {} tris",
+            "loaded mesh: {} quads, {} verts, {} tris",
             mesh.quad_count(),
             mesh.positions.len(),
             mesh.triangle_count()
@@ -374,10 +400,12 @@ impl Gpu {
             chunk,
             materials,
             current_material: 5, // "Sky", matching the mockup's default selection
+            paint_mode: PaintMode::Add,
             dragging: false,
             cursor_pos: (0.0, 0.0),
             drag_last: None,
             press_pos: None,
+            modifiers: ModifiersState::default(),
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -424,7 +452,7 @@ impl Gpu {
                             + (self.cursor_pos.1 - press.1).powi(2))
                         .sqrt();
                         if moved < Self::CLICK_MOVE_THRESHOLD {
-                            self.try_add_voxel(self.cursor_pos.0, self.cursor_pos.1);
+                            self.apply_paint(self.cursor_pos.0, self.cursor_pos.1);
                         }
                     }
                 }
@@ -484,25 +512,45 @@ impl Gpu {
         (near_world, (far_world - near_world).normalize())
     }
 
-    fn try_add_voxel(&mut self, x: f64, y: f64) {
+    /// Left-click entry point: does whatever the current PaintMode says to
+    /// do at the clicked face -- add, replace-in-place, or remove.
+    fn apply_paint(&mut self, x: f64, y: f64) {
         let (origin, dir) = self.cursor_ray(x, y);
         let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
-        let Some(place) = hit.place_at else { return };
 
-        let size = CHUNK_SIZE as i32;
-        if place.x < 0 || place.y < 0 || place.z < 0 || place.x >= size || place.y >= size || place.z >= size {
-            return; // would be outside this chunk -- multi-chunk placement comes later
+        match self.paint_mode {
+            PaintMode::Add => {
+                let Some(place) = hit.place_at else { return };
+                let size = CHUNK_SIZE as i32;
+                if place.x < 0 || place.y < 0 || place.z < 0 || place.x >= size || place.y >= size || place.z >= size
+                {
+                    return;
+                }
+                self.chunk.set(
+                    place.x as usize,
+                    place.y as usize,
+                    place.z as usize,
+                    Voxel::new(self.current_material),
+                );
+            }
+            PaintMode::Replace => {
+                self.chunk.set(
+                    hit.voxel.x as usize,
+                    hit.voxel.y as usize,
+                    hit.voxel.z as usize,
+                    Voxel::new(self.current_material),
+                );
+            }
+            PaintMode::Remove => {
+                self.chunk
+                    .set(hit.voxel.x as usize, hit.voxel.y as usize, hit.voxel.z as usize, Voxel::EMPTY);
+            }
         }
-
-        self.chunk.set(
-            place.x as usize,
-            place.y as usize,
-            place.z as usize,
-            Voxel::new(self.current_material),
-        );
         self.rebuild_mesh();
     }
 
+    /// Right-click quick-remove, independent of whatever PaintMode is
+    /// currently selected -- lets you erase without switching modes.
     fn try_remove_voxel(&mut self, x: f64, y: f64) {
         let (origin, dir) = self.cursor_ray(x, y);
         let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
@@ -512,10 +560,6 @@ impl Gpu {
     }
 
     /// Re-runs the greedy mesher and re-uploads the vertex/index buffers.
-    /// Simple approach for v1: rebuild both buffers from scratch on every
-    /// edit rather than trying to patch them in place. Fine for
-    /// single-chunk, interactive editing; we'll optimize if it ever
-    /// becomes a bottleneck on bigger scenes.
     fn rebuild_mesh(&mut self) {
         let mesh = greedy_mesh(&self.chunk);
         let vertices = mesh_to_vertices(&mesh, &self.materials);
@@ -567,16 +611,24 @@ impl Gpu {
             pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
-        // --- egui overlay: materials panel ---
+        // --- egui overlay: paint mode + materials panel ---
         let raw_input = self.egui_state.take_egui_input(&*self.window);
         let materials = self.materials.clone();
         let mut selected = self.current_material;
+        let mut paint_mode = self.paint_mode;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             egui::SidePanel::right("materials_panel")
                 .resizable(false)
                 .default_width(220.0)
                 .show(ctx, |ui| {
+                    ui.heading("Paint Mode");
+                    ui.separator();
+                    ui.radio_value(&mut paint_mode, PaintMode::Add, "Add Voxels");
+                    ui.radio_value(&mut paint_mode, PaintMode::Replace, "Replace Material");
+                    ui.radio_value(&mut paint_mode, PaintMode::Remove, "Remove Voxels");
+
+                    ui.add_space(12.0);
                     ui.heading("Materials");
                     ui.separator();
                     for m in &materials {
@@ -600,9 +652,12 @@ impl Gpu {
                     ui.separator();
                     let name = materials.iter().find(|m| m.id == selected).map(|m| m.name).unwrap_or("?");
                     ui.label(format!("Selected material: {name}"));
+                    ui.add_space(12.0);
+                    ui.label("Ctrl+S to save");
                 });
         });
         self.current_material = selected;
+        self.paint_mode = paint_mode;
 
         self.egui_state.handle_platform_output(&*self.window, full_output.platform_output);
         let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -630,9 +685,6 @@ impl Gpu {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // egui-wgpu's renderer wants a render pass decoupled from the
-            // encoder's borrow lifetime; forget_lifetime() is the standard
-            // way to hand it one.
             let mut egui_pass = egui_pass.forget_lifetime();
             self.egui_renderer.render(&mut egui_pass, &clipped_primitives, &screen_descriptor);
         }
@@ -685,6 +737,7 @@ impl ApplicationHandler for App {
                     gpu.handle_scroll(delta);
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => gpu.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if !consumed_by_ui && event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
@@ -692,6 +745,7 @@ impl ApplicationHandler for App {
                             KeyCode::Digit1 => gpu.set_material(1),
                             KeyCode::Digit2 => gpu.set_material(2),
                             KeyCode::Digit3 => gpu.set_material(3),
+                            KeyCode::KeyS if gpu.modifiers.control_key() => gpu.save(),
                             _ => {}
                         }
                     }
