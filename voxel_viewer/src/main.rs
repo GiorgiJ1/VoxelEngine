@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3, Vec4};
+use glam::{IVec3, Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -186,6 +186,8 @@ struct Gpu {
     drag_last: Option<(f64, f64)>,
     press_pos: Option<(f64, f64)>,
     modifiers: ModifiersState,
+    undo_stack: Vec<Vec<u16>>,
+    redo_stack: Vec<Vec<u16>>,
     egui_ctx: egui::Context,
     egui_state: EguiState,
     egui_renderer: EguiRenderer,
@@ -366,7 +368,7 @@ impl Gpu {
         });
 
         println!(
-            "loaded mesh: {} quads, {} verts, {} tris",
+            "loaded demo mesh: {} quads, {} verts, {} tris",
             mesh.quad_count(),
             mesh.positions.len(),
             mesh.triangle_count()
@@ -406,6 +408,8 @@ impl Gpu {
             drag_last: None,
             press_pos: None,
             modifiers: ModifiersState::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -518,34 +522,27 @@ impl Gpu {
         let (origin, dir) = self.cursor_ray(x, y);
         let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
 
-        match self.paint_mode {
-            PaintMode::Add => {
-                let Some(place) = hit.place_at else { return };
+        let target: Option<(IVec3, Voxel)> = match self.paint_mode {
+            PaintMode::Add => hit.place_at.and_then(|p| {
                 let size = CHUNK_SIZE as i32;
-                if place.x < 0 || place.y < 0 || place.z < 0 || place.x >= size || place.y >= size || place.z >= size
-                {
-                    return;
+                if p.x < 0 || p.y < 0 || p.z < 0 || p.x >= size || p.y >= size || p.z >= size {
+                    None
+                } else {
+                    Some((p, Voxel::new(self.current_material)))
                 }
-                self.chunk.set(
-                    place.x as usize,
-                    place.y as usize,
-                    place.z as usize,
-                    Voxel::new(self.current_material),
-                );
-            }
-            PaintMode::Replace => {
-                self.chunk.set(
-                    hit.voxel.x as usize,
-                    hit.voxel.y as usize,
-                    hit.voxel.z as usize,
-                    Voxel::new(self.current_material),
-                );
-            }
-            PaintMode::Remove => {
-                self.chunk
-                    .set(hit.voxel.x as usize, hit.voxel.y as usize, hit.voxel.z as usize, Voxel::EMPTY);
-            }
+            }),
+            PaintMode::Replace => Some((hit.voxel, Voxel::new(self.current_material))),
+            PaintMode::Remove => Some((hit.voxel, Voxel::EMPTY)),
+        };
+
+        let Some((pos, new_voxel)) = target else { return };
+        let current = self.chunk.get(pos.x as usize, pos.y as usize, pos.z as usize);
+        if current == new_voxel {
+            return; // no-op edit -- don't pollute undo history
         }
+
+        self.push_undo_snapshot();
+        self.chunk.set(pos.x as usize, pos.y as usize, pos.z as usize, new_voxel);
         self.rebuild_mesh();
     }
 
@@ -554,9 +551,49 @@ impl Gpu {
     fn try_remove_voxel(&mut self, x: f64, y: f64) {
         let (origin, dir) = self.cursor_ray(x, y);
         let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
+        self.push_undo_snapshot();
         self.chunk
             .set(hit.voxel.x as usize, hit.voxel.y as usize, hit.voxel.z as usize, Voxel::EMPTY);
         self.rebuild_mesh();
+    }
+
+    /// How many past states to keep. 50 undos is plenty for a single-chunk
+    /// editor and costs almost nothing -- each snapshot is a Vec<u16> of
+    /// 4096 voxel ids, ~8KB, so the whole stack tops out around 400KB.
+    const MAX_HISTORY: usize = 50;
+
+    /// Records the chunk's current state onto the undo stack before a
+    /// mutation, and clears the redo stack.
+    fn push_undo_snapshot(&mut self) {
+        self.undo_stack.push(self.chunk.to_ids());
+        if self.undo_stack.len() > Self::MAX_HISTORY {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        let Some(prev_ids) = self.undo_stack.pop() else {
+            println!("nothing to undo");
+            return;
+        };
+        self.redo_stack.push(self.chunk.to_ids());
+        if let Some(restored) = Chunk::from_ids(&prev_ids) {
+            self.chunk = restored;
+            self.rebuild_mesh();
+        }
+    }
+
+    fn redo(&mut self) {
+        let Some(next_ids) = self.redo_stack.pop() else {
+            println!("nothing to redo");
+            return;
+        };
+        self.undo_stack.push(self.chunk.to_ids());
+        if let Some(restored) = Chunk::from_ids(&next_ids) {
+            self.chunk = restored;
+            self.rebuild_mesh();
+        }
     }
 
     /// Re-runs the greedy mesher and re-uploads the vertex/index buffers.
@@ -653,7 +690,7 @@ impl Gpu {
                     let name = materials.iter().find(|m| m.id == selected).map(|m| m.name).unwrap_or("?");
                     ui.label(format!("Selected material: {name}"));
                     ui.add_space(12.0);
-                    ui.label("Ctrl+S to save");
+                    ui.label("Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo");
                 });
         });
         self.current_material = selected;
@@ -746,6 +783,9 @@ impl ApplicationHandler for App {
                             KeyCode::Digit2 => gpu.set_material(2),
                             KeyCode::Digit3 => gpu.set_material(3),
                             KeyCode::KeyS if gpu.modifiers.control_key() => gpu.save(),
+                            KeyCode::KeyZ if gpu.modifiers.control_key() && gpu.modifiers.shift_key() => gpu.redo(),
+                            KeyCode::KeyZ if gpu.modifiers.control_key() => gpu.undo(),
+                            KeyCode::KeyY if gpu.modifiers.control_key() => gpu.redo(),
                             _ => {}
                         }
                     }
