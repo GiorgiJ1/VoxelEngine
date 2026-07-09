@@ -378,7 +378,7 @@ impl Gpu {
         let egui_state = EguiState::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
-            &*window,
+            &window,
             Some(window.scale_factor() as f32),
             None,
             None,
