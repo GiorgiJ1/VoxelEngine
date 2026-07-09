@@ -9,7 +9,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use voxel_core::{greedy_mesh, load_chunk, raycast_chunk, save_chunk, Chunk, MeshData, Voxel, CHUNK_SIZE};
+use voxel_core::{
+    export_gltf_glb, greedy_mesh, load_chunk, raycast_chunk, save_chunk, Chunk, MeshData, Voxel, CHUNK_SIZE,
+};
 
 use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
 use egui_winit::State as EguiState;
@@ -44,8 +46,7 @@ struct Uniforms {
 }
 
 /// Mouse-controlled orbit camera: left-drag rotates around `target`,
-/// scroll zooms in/out. This is the standard "look at a 3D model" camera
-/// you'd want for an asset editor, as opposed to a first-person flycam.
+/// scroll zooms in/out.
 struct Camera {
     target: Vec3,
     yaw: f32,
@@ -67,7 +68,6 @@ impl Camera {
         proj * view
     }
 
-    /// dx/dy are raw cursor-movement deltas in pixels while dragging.
     fn orbit(&mut self, dx: f32, dy: f32) {
         const SENSITIVITY: f32 = 0.005;
         self.yaw -= dx * SENSITIVITY;
@@ -100,8 +100,7 @@ enum PaintMode {
     Remove,
 }
 
-/// A single entry in the artist's palette: an id (what gets stored per
-/// voxel), a display name, and an RGB swatch color.
+/// A single entry in the artist's palette.
 #[derive(Clone)]
 struct Material {
     id: u16,
@@ -212,11 +211,24 @@ impl Gpu {
     /// executable. Multi-file project management (New/Open/Save As) comes
     /// once there's more than a single chunk worth saving.
     const SAVE_PATH: &'static str = "voxel_save.bin";
+    /// Where "Export" writes a Unity/Unreal-ready mesh. Binary glTF (.glb)
+    /// keeps geometry + per-vertex color in one self-contained file.
+    const EXPORT_PATH: &'static str = "voxel_export.glb";
 
     fn save(&self) {
         match save_chunk(&self.chunk, std::path::Path::new(Self::SAVE_PATH)) {
             Ok(()) => println!("saved to {}", Self::SAVE_PATH),
             Err(e) => eprintln!("save failed: {e}"),
+        }
+    }
+
+    fn export(&self) {
+        let mesh = greedy_mesh(&self.chunk);
+        let materials = self.materials.clone();
+        let glb = export_gltf_glb(&mesh, move |id| material_color(&materials, id));
+        match std::fs::write(Self::EXPORT_PATH, &glb) {
+            Ok(()) => println!("exported to {} ({} bytes)", Self::EXPORT_PATH, glb.len()),
+            Err(e) => eprintln!("export failed: {e}"),
         }
     }
 
@@ -368,7 +380,7 @@ impl Gpu {
         });
 
         println!(
-            "loaded demo mesh: {} quads, {} verts, {} tris",
+            "loaded mesh: {} quads, {} verts, {} tris",
             mesh.quad_count(),
             mesh.positions.len(),
             mesh.triangle_count()
@@ -378,7 +390,7 @@ impl Gpu {
         let egui_state = EguiState::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
-            &window,
+            &*window,
             Some(window.scale_factor() as f32),
             None,
             None,
@@ -437,8 +449,6 @@ impl Gpu {
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    /// Small movement threshold (in pixels) below which a press+release is
-    /// treated as a "click" (place a voxel) rather than a camera drag.
     const CLICK_MOVE_THRESHOLD: f64 = 4.0;
 
     fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
@@ -495,10 +505,6 @@ impl Gpu {
         println!("current material: {id}");
     }
 
-    /// Unprojects a screen-space cursor position into a world-space ray,
-    /// using the inverse of the exact view-proj matrix the camera renders
-    /// with -- so the ray always matches what's on screen, regardless of
-    /// window size or camera position.
     fn cursor_ray(&self, x: f64, y: f64) -> (Vec3, Vec3) {
         let width = self.config.width as f32;
         let height = self.config.height.max(1) as f32;
@@ -516,8 +522,6 @@ impl Gpu {
         (near_world, (far_world - near_world).normalize())
     }
 
-    /// Left-click entry point: does whatever the current PaintMode says to
-    /// do at the clicked face -- add, replace-in-place, or remove.
     fn apply_paint(&mut self, x: f64, y: f64) {
         let (origin, dir) = self.cursor_ray(x, y);
         let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
@@ -538,7 +542,7 @@ impl Gpu {
         let Some((pos, new_voxel)) = target else { return };
         let current = self.chunk.get(pos.x as usize, pos.y as usize, pos.z as usize);
         if current == new_voxel {
-            return; // no-op edit -- don't pollute undo history
+            return;
         }
 
         self.push_undo_snapshot();
@@ -546,8 +550,6 @@ impl Gpu {
         self.rebuild_mesh();
     }
 
-    /// Right-click quick-remove, independent of whatever PaintMode is
-    /// currently selected -- lets you erase without switching modes.
     fn try_remove_voxel(&mut self, x: f64, y: f64) {
         let (origin, dir) = self.cursor_ray(x, y);
         let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
@@ -557,13 +559,8 @@ impl Gpu {
         self.rebuild_mesh();
     }
 
-    /// How many past states to keep. 50 undos is plenty for a single-chunk
-    /// editor and costs almost nothing -- each snapshot is a Vec<u16> of
-    /// 4096 voxel ids, ~8KB, so the whole stack tops out around 400KB.
     const MAX_HISTORY: usize = 50;
 
-    /// Records the chunk's current state onto the undo stack before a
-    /// mutation, and clears the redo stack.
     fn push_undo_snapshot(&mut self) {
         self.undo_stack.push(self.chunk.to_ids());
         if self.undo_stack.len() > Self::MAX_HISTORY {
@@ -596,7 +593,6 @@ impl Gpu {
         }
     }
 
-    /// Re-runs the greedy mesher and re-uploads the vertex/index buffers.
     fn rebuild_mesh(&mut self) {
         let mesh = greedy_mesh(&self.chunk);
         let vertices = mesh_to_vertices(&mesh, &self.materials);
@@ -648,17 +644,23 @@ impl Gpu {
             pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
-        // --- egui overlay: paint mode + materials panel ---
+        // --- egui overlay: export button, paint mode + materials panel ---
         let raw_input = self.egui_state.take_egui_input(&*self.window);
         let materials = self.materials.clone();
         let mut selected = self.current_material;
         let mut paint_mode = self.paint_mode;
+        let mut export_requested = false;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             egui::SidePanel::right("materials_panel")
                 .resizable(false)
                 .default_width(220.0)
                 .show(ctx, |ui| {
+                    if ui.button("Export .glb").clicked() {
+                        export_requested = true;
+                    }
+                    ui.add_space(8.0);
+
                     ui.heading("Paint Mode");
                     ui.separator();
                     ui.radio_value(&mut paint_mode, PaintMode::Add, "Add Voxels");
@@ -690,11 +692,14 @@ impl Gpu {
                     let name = materials.iter().find(|m| m.id == selected).map(|m| m.name).unwrap_or("?");
                     ui.label(format!("Selected material: {name}"));
                     ui.add_space(12.0);
-                    ui.label("Ctrl+S save · Ctrl+Z undo · Ctrl+Shift+Z redo");
+                    ui.label("Ctrl+S save · Ctrl+E export · Ctrl+Z undo · Ctrl+Shift+Z redo");
                 });
         });
         self.current_material = selected;
         self.paint_mode = paint_mode;
+        if export_requested {
+            self.export();
+        }
 
         self.egui_state.handle_platform_output(&*self.window, full_output.platform_output);
         let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -783,6 +788,7 @@ impl ApplicationHandler for App {
                             KeyCode::Digit2 => gpu.set_material(2),
                             KeyCode::Digit3 => gpu.set_material(3),
                             KeyCode::KeyS if gpu.modifiers.control_key() => gpu.save(),
+                            KeyCode::KeyE if gpu.modifiers.control_key() => gpu.export(),
                             KeyCode::KeyZ if gpu.modifiers.control_key() && gpu.modifiers.shift_key() => gpu.redo(),
                             KeyCode::KeyZ if gpu.modifiers.control_key() => gpu.undo(),
                             KeyCode::KeyY if gpu.modifiers.control_key() => gpu.redo(),
