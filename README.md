@@ -1,7 +1,3 @@
-Here is a clean, minimalistic, and developer-focused `README.md` file designed for your voxel engine project. It highlights the custom modern graphics pipeline architecture, the efficient greedy meshing implementation, and keyboard/mouse workflows.
-
----
-
 # 🧊 Voxel Engine (Viewer v1)
 
 A high-performance, lightweight 3D voxel engine editor built from scratch in Rust using modern explicit graphics primitives. It features a custom greedy meshing engine, an optimized hardware-accelerated rendering pipeline via WGPU, and an embedded UI layer for rapid asset design and palette prototyping.
