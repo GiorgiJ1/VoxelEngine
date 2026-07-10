@@ -1,10 +1,3 @@
-Here is a clean, comprehensive `README.md` file for your workspace root. It documents the architecture, the multi-material export capabilities (`.glb` and `.obj`/`.mtl`), user interface keybindings, and instructions on how to build and run the engine.
-
-### `README.md`
-
-Create a file named `README.md` in your project's root directory (`G:\Downloads\VoxelEngine-main\VoxelEngine-main\README.md`) and add the following content:
-
-```markdown
 # Retro Voxel Engine & Viewer
 
 A lightweight, high-performance 3D voxel engine built from scratch in Rust using modern low-level systems libraries. The project utilizes `wgpu` for pure hardware-accelerated rendering via WebGPU standards and `winit` for low-overhead window handling, featuring a clean retro arcade aesthetic side panel rendered with `egui`.
