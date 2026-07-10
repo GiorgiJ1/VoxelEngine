@@ -1,71 +1,103 @@
-# 🧊 Voxel Engine (Viewer v1)
+Here is a clean, comprehensive `README.md` file for your workspace root. It documents the architecture, the multi-material export capabilities (`.glb` and `.obj`/`.mtl`), user interface keybindings, and instructions on how to build and run the engine.
 
-A high-performance, lightweight 3D voxel engine editor built from scratch in Rust using modern explicit graphics primitives. It features a custom greedy meshing engine, an optimized hardware-accelerated rendering pipeline via WGPU, and an embedded UI layer for rapid asset design and palette prototyping.
+### `README.md`
 
-## 🚀 Architecture & Technical Highlights
+Create a file named `README.md` in your project's root directory (`G:\Downloads\VoxelEngine-main\VoxelEngine-main\README.md`) and add the following content:
 
-* **Modern Graphics Stack:** Fully custom rendering engine utilizing `wgpu` targeting modern explicit APIs (Vulkan/Metal/DX12), moving away from legacy state machines into modern command encoders and explicit pipeline state objects (PSOs).
-* **Greedy Meshing:** Implements an optimized greedy meshing algorithm that culls hidden faces and merges adjacent co-planar coplanar faces across a dense `16x16x16` local chunk, drastically reducing vertex layout overhead and minimizing batch submission sizes.
-* **Deterministic Raycasting:** Built-in exact 3D AABB voxel raycasting loop calculating immediate intersecting voxel faces for deterministic building, replacing, and erasing actions.
-* **State Management:** Low-overhead undo/redo snapshot architecture tracking a compact state history rolling stack (~8KB per snapshot layer).
-* **Binary Persistence:** Direct serialization and deserialization via `bincode` to native byte streams with explicit binary versioning to guarantee backward compatibility on struct layout modifications.
+```markdown
+# Retro Voxel Engine & Viewer
 
----
+A lightweight, high-performance 3D voxel engine built from scratch in Rust using modern low-level systems libraries. The project utilizes `wgpu` for pure hardware-accelerated rendering via WebGPU standards and `winit` for low-overhead window handling, featuring a clean retro arcade aesthetic side panel rendered with `egui`.
 
-## 🛠️ Controls & Workflow
-
-### Mouse Navigation & Actions
-
-| Input | Action | Description |
-| --- | --- | --- |
-| **Left Click + Drag** | **Orbit Camera** | Standard 3D viewer camera trackball orbit around the chunk target center. |
-| **Mouse Wheel** | **Zoom** | Zoom smoothly in and out with clamped bounding distances. |
-| **Left Click** | **Apply Paint** | Places, updates, or erases a voxel based on your selected sidebar **Paint Mode**. |
-| **Middle Click** | **Material Picker** | Samples the material ID of the voxel directly under the cursor and shifts your current palette to match. |
-| **Right Click** | **Quick Erase** | Direct shortcut to remove a voxel instantly, bypassing your current paint mode. |
-
-### Hotkeys
-
-* `Ctrl + S`: Commit state to disk (`voxel_save.bin`).
-* `Ctrl + Z`: Undo last voxel alteration.
-* `Ctrl + Shift + Z` or `Ctrl + Y`: Redo last undone alteration.
-* `1` / `2` / `3`: Quick-swap active paint palette to Materials `#01`, `#02`, or `#03`.
+The engine implements a multi-material architecture, custom asset saving/loading configurations, a fast 3D cross-section mesher, and versatile 3D asset exporters.
 
 ---
 
-## 📦 Project Structure
+## 🏗️ Project Architecture
+
+The engine is structured as a cargo workspace containing two decoupled crates:
 
 ```text
-├── main.rs              # Application entry point, Winit window loop, and WGPU render state management
-├── shaders/
-│   └── shader.wgsl      # Custom WGSL vertex and fragment shaders processing world transforms and lighting
-└── voxel_core/          # Core voxel manipulation & processing engine
-    ├── chunk.rs         # Dense array allocation, indexing arithmetic, and state tracking
-    ├── voxel.rs         # Voxel primitive definitions and structural states
-    ├── mesher.rs        # Greedy mesher face-merging implementation
-    ├── raycast.rs       # 3D DDA/AABB intersection calculations for face targeting
-    └── persistence.rs   # Binary I/O codec pipelines
+├── voxel_core/            # Core Game Engine Logic & Shared Data Layouts
+│   ├── src/
+│   │   ├── chunk.rs       # 32x32x32 uniform spatial subdivision buffers
+│   │   ├── mesher.rs      # Greedy meshing optimization logic
+│   │   ├── raycast.rs     # Ray-aabb intersection for voxel grid placement
+│   │   ├── export.rs      # Multi-material GLB, OBJ, and MTL encoders
+│   │   └── lib.rs         # Public workspace API surface definitions
+│   └── Cargo.toml
+│
+└── voxel_viewer/          # Graphical Subsystem & Application Entry point
+    ├── src/
+    │   ├── shaders/       # WGSL hardware pipeline shader targets
+    │   └── main.rs        # WGPU device bindings, state management, and egui loops
+    └── Cargo.toml
 
 ```
 
 ---
 
-## ⚡ Quick Start
+## 🚀 Key Features
 
-Ensure you have the latest stable [Rust toolchain installed](https://rustup.rs/).
+* **Greedy Meshing Optimization:** Reduces spatial face counts significantly by combining raw neighboring voxel cubes sharing matching material data properties into single optimized stretch quads.
+* **Dual-Format Asset Exporters:**
+* **Compact glTF 2.0 Binary (`.glb`):** Packaged self-contained binary outputs containing coordinate systems and inline layout accessors for explicit RGB vertex color pipelines.
+* **Split Multi-Material Wavefront (`.obj`/`.mtl`):** Generates structural mesh face descriptions partitioned perfectly by material index references mapping directly onto standard ambient/diffuse material library definition logs.
 
-### Development Build
+
+* **Non-Destructive State Undo/Redo Engine:** Captures chronological 50-step historical layout buffers allowing instant backward and forward spatial tracking safely.
+* **Orbit Camera System:** High-density raycasting pipelines supporting sub-voxel tracking for additive painting, material replacement, or precise face elimination.
+
+---
+
+## 🎮 Interface & Keybindings
+
+Interact with the viewport using your mouse and quick hotkeys:
+
+### Camera Control
+
+* **Left-Click + Drag:** Orbit around look-at target coordinate.
+* **Scroll Wheel:** Zoom camera focus inward or outward.
+
+### Editor Operations
+
+* **Left-Click:** Paint action (triggers Add, Replace, or Remove based on current selection in side-panel).
+* **Right-Click:** Quick-Remove voxel shortcut (bypasses current tool mode).
+
+### Quick Hotkeys
+
+| Keybinding | Action |
+| --- | --- |
+| `1`, `2`, `3` | Instantly hot-swap to active material indices |
+| `Ctrl + S` | Save current chunk state onto disk (`voxel_save.bin`) |
+| `Ctrl + E` | Export active mesh to binary glTF layout (`voxel_export.glb`) |
+| `Ctrl + Z` | Undo last voxel structural paint manipulation |
+| `Ctrl + Shift + Z` / `Ctrl + Y` | Redo previously reverted paint change operation |
+
+---
+
+## 🛠️ Building and Running
+
+Ensure you have the latest stable Rust toolchain setup on your system environment.
+
+### Compile the Workspace
+
+To build all binary assets and dependent engine library layers inside the workspace cleanly, run:
 
 ```bash
-cargo check
+cargo build --workspace
 
 ```
 
-### Run Client Viewer
+### Execute the Engine Viewer
 
-Always run the engine with optimization flags enabled. The greedy meshing architecture relies on optimized compiler loops to construct meshes instantly when large edits occur.
+To spin up the WebGPU pipeline window wrapper and run the voxel editor instance directly, execute:
 
 ```bash
-cargo run --release
+cargo run -p voxel_viewer
+
+```
+
+```
 
 ```
