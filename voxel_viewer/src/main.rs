@@ -10,7 +10,7 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use voxel_core::{
-    export_gltf_glb, greedy_mesh, load_chunk, raycast_chunk, save_chunk, Chunk, MeshData, Voxel, CHUNK_SIZE,
+    export_gltf_glb, export_obj_mtl, greedy_mesh, load_chunk, raycast_chunk, save_chunk, Chunk, MeshData, Voxel, CHUNK_SIZE,
 };
 
 use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
@@ -207,13 +207,9 @@ fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration)
 }
 
 impl Gpu {
-    /// v1 keeps this dead simple: one fixed save file next to the
-    /// executable. Multi-file project management (New/Open/Save As) comes
-    /// once there's more than a single chunk worth saving.
     const SAVE_PATH: &'static str = "voxel_save.bin";
-    /// Where "Export" writes a Unity/Unreal-ready mesh. Binary glTF (.glb)
-    /// keeps geometry + per-vertex color in one self-contained file.
     const EXPORT_PATH: &'static str = "voxel_export.glb";
+    const OBJ_EXPORT_BASE: &'static str = "voxel_export";
 
     fn save(&self) {
         match save_chunk(&self.chunk, std::path::Path::new(Self::SAVE_PATH)) {
@@ -224,11 +220,25 @@ impl Gpu {
 
     fn export(&self) {
         let mesh = greedy_mesh(&self.chunk);
-        let materials = self.materials.clone();
-        let glb = export_gltf_glb(&mesh, move |id| material_color(&materials, id));
-        match std::fs::write(Self::EXPORT_PATH, &glb) {
-            Ok(()) => println!("exported to {} ({} bytes)", Self::EXPORT_PATH, glb.len()),
-            Err(e) => eprintln!("export failed: {e}"),
+        
+        let mut resolver = [[0.5f32; 3]; 256];
+        for m in &self.materials {
+            if (m.id as usize) < 256 {
+                resolver[m.id as usize] = m.color;
+            }
+        }
+
+        match export_gltf_glb(&mesh, std::path::Path::new(Self::EXPORT_PATH), &resolver) {
+            Ok(()) => println!("exported glTF to {}", Self::EXPORT_PATH),
+            Err(e) => eprintln!("export glTF failed: {e}"),
+        }
+    }
+
+    fn export_obj(&self) {
+        let mesh = greedy_mesh(&self.chunk);
+        match export_obj_mtl(&mesh, std::path::Path::new(Self::OBJ_EXPORT_BASE)) {
+            Ok(()) => println!("exported OBJ/MTL group to {}.obj/.mtl", Self::OBJ_EXPORT_BASE),
+            Err(e) => eprintln!("export OBJ failed: {e}"),
         }
     }
 
@@ -413,7 +423,7 @@ impl Gpu {
             camera: Camera::default(),
             chunk,
             materials,
-            current_material: 5, // "Sky", matching the mockup's default selection
+            current_material: 5,
             paint_mode: PaintMode::Add,
             dragging: false,
             cursor_pos: (0.0, 0.0),
@@ -644,21 +654,26 @@ impl Gpu {
             pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
-        // --- egui overlay: export button, paint mode + materials panel ---
         let raw_input = self.egui_state.take_egui_input(&*self.window);
         let materials = self.materials.clone();
         let mut selected = self.current_material;
         let mut paint_mode = self.paint_mode;
         let mut export_requested = false;
+        let mut export_obj_requested = false;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             egui::SidePanel::right("materials_panel")
                 .resizable(false)
                 .default_width(220.0)
                 .show(ctx, |ui| {
-                    if ui.button("Export .glb").clicked() {
-                        export_requested = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Export .glb").clicked() {
+                            export_requested = true;
+                        }
+                        if ui.button("Export .obj").clicked() {
+                            export_obj_requested = true;
+                        }
+                    });
                     ui.add_space(8.0);
 
                     ui.heading("Paint Mode");
@@ -699,6 +714,9 @@ impl Gpu {
         self.paint_mode = paint_mode;
         if export_requested {
             self.export();
+        }
+        if export_obj_requested {
+            self.export_obj();
         }
 
         self.egui_state.handle_platform_output(&*self.window, full_output.platform_output);

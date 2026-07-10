@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::Path;
 
 use crate::mesh::MeshData;
 
-// --- Minimal glTF 2.0 JSON schema (just the subset we actually emit) ---
+// --- Minimal glTF 2.0 JSON schema ---
 
 #[derive(Serialize, Deserialize)]
 struct GltfAsset {
@@ -42,6 +45,13 @@ struct GltfAccessor {
 }
 
 #[derive(Serialize, Deserialize)]
+struct GltfMeshPrimitive {
+    attributes: GltfAttributes,
+    indices: u32,
+    mode: u32,
+}
+
+#[derive(Serialize, Deserialize)]
 struct GltfAttributes {
     #[serde(rename = "POSITION")]
     position: u32,
@@ -52,15 +62,8 @@ struct GltfAttributes {
 }
 
 #[derive(Serialize, Deserialize)]
-struct GltfPrimitive {
-    attributes: GltfAttributes,
-    indices: u32,
-    mode: u32,
-}
-
-#[derive(Serialize, Deserialize)]
 struct GltfMesh {
-    primitives: Vec<GltfPrimitive>,
+    primitives: Vec<GltfMeshPrimitive>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -76,196 +79,149 @@ struct GltfScene {
 #[derive(Serialize, Deserialize)]
 struct GltfRoot {
     asset: GltfAsset,
-    scene: u32,
-    scenes: Vec<GltfScene>,
-    nodes: Vec<GltfNode>,
-    meshes: Vec<GltfMesh>,
-    accessors: Vec<GltfAccessor>,
+    buffers: Vec<GltfBuffer>,
     #[serde(rename = "bufferViews")]
     buffer_views: Vec<GltfBufferView>,
-    buffers: Vec<GltfBuffer>,
+    accessors: Vec<GltfAccessor>,
+    meshes: Vec<GltfMesh>,
+    nodes: Vec<GltfNode>,
+    scenes: Vec<GltfScene>,
+    scene: u32,
 }
 
-const COMPONENT_TYPE_FLOAT: u32 = 5126;
-const COMPONENT_TYPE_UNSIGNED_INT: u32 = 5125;
-const MODE_TRIANGLES: u32 = 4;
-const TARGET_ARRAY_BUFFER: u32 = 34962;
-const TARGET_ELEMENT_ARRAY_BUFFER: u32 = 34963;
+pub fn export_gltf_glb(mesh: &MeshData, path: &Path, materials_resolver: &[ [f32; 3]; 256 ]) -> io::Result<()> {
+    let mut pos_bytes = Vec::new();
+    let mut norm_bytes = Vec::new();
+    let mut col_bytes = Vec::new();
+    let mut idx_bytes = Vec::new();
 
-fn positions_min_max(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    for p in positions {
-        for i in 0..3 {
-            min[i] = min[i].min(p[i]);
-            max[i] = max[i].max(p[i]);
+    let mut min_pos = [f32::INFINITY; 3];
+    let mut max_pos = [f32::NEG_INFINITY; 3];
+
+    for &p in &mesh.positions {
+        for axis in 0..3 {
+            min_pos[axis] = min_pos[axis].min(p[axis]);
+            max_pos[axis] = max_pos[axis].max(p[axis]);
         }
+        pos_bytes.extend_from_slice(bytemuck::bytes_of(&p));
     }
-    if positions.is_empty() {
-        min = [0.0; 3];
-        max = [0.0; 3];
+
+    for &n in &mesh.normals {
+        norm_bytes.extend_from_slice(bytemuck::bytes_of(&n));
     }
-    (min, max)
-}
 
-/// Exports a mesh as a self-contained binary glTF (.glb) file.
-///
-/// `color_for_id` maps a voxel material id to an RGB color -- the caller
-/// owns the actual palette (names, ordering, etc.), this function only
-/// needs the colors themselves. Colors are baked in as a per-vertex
-/// COLOR_0 attribute rather than separate materials/textures, which is the
-/// simplest way to carry voxel-art coloring into glTF; most viewers
-/// (Blender, three.js, Unity's glTFast) honor vertex colors automatically.
-/// Unreal's importer sometimes needs the material graph adjusted to
-/// multiply vertex color in -- it isn't always automatic there.
-pub fn export_gltf_glb(mesh: &MeshData, color_for_id: impl Fn(u16) -> [f32; 3]) -> Vec<u8> {
-    let vertex_count = mesh.positions.len();
-
-    // Lay out the binary buffer as four contiguous, already-4-byte-aligned
-    // sections (every component here is either 4-byte f32 or 4-byte u32,
-    // so no manual padding is needed between sections).
-    let mut bin = Vec::with_capacity(vertex_count * (12 + 12 + 16) + mesh.indices.len() * 4);
-
-    let positions_offset = bin.len();
-    for p in &mesh.positions {
-        for component in p {
-            bin.extend_from_slice(&component.to_le_bytes());
-        }
+    for &voxel_id in &mesh.voxel_ids {
+        let rgb = materials_resolver.get(voxel_id as usize).copied().unwrap_or([0.5, 0.5, 0.5]);
+        let rgba = [rgb[0], rgb[1], rgb[2], 1.0f32];
+        col_bytes.extend_from_slice(bytemuck::bytes_of(&rgba));
     }
-    let positions_len = bin.len() - positions_offset;
 
-    let normals_offset = bin.len();
-    for n in &mesh.normals {
-        for component in n {
-            bin.extend_from_slice(&component.to_le_bytes());
-        }
+    for &idx in &mesh.indices {
+        idx_bytes.extend_from_slice(bytemuck::bytes_of(&idx));
     }
-    let normals_len = bin.len() - normals_offset;
 
-    let colors_offset = bin.len();
-    for id in &mesh.voxel_ids {
-        let [r, g, b] = color_for_id(*id);
-        for component in [r, g, b, 1.0] {
-            bin.extend_from_slice(&component.to_le_bytes());
-        }
+    let mut bin_buffer = Vec::new();
+    let view_pos_offset = bin_buffer.len();
+    bin_buffer.extend_from_slice(&pos_bytes);
+    let view_pos_len = pos_bytes.len();
+
+    let view_norm_offset = bin_buffer.len();
+    bin_buffer.extend_from_slice(&norm_bytes);
+    let view_norm_len = norm_bytes.len();
+
+    let view_col_offset = bin_buffer.len();
+    bin_buffer.extend_from_slice(&col_bytes);
+    let view_col_len = col_bytes.len();
+
+    let view_idx_offset = bin_buffer.len();
+    bin_buffer.extend_from_slice(&idx_bytes);
+    let view_idx_len = idx_bytes.len();
+
+    while bin_buffer.len() % 4 != 0 {
+        bin_buffer.push(0);
     }
-    let colors_len = bin.len() - colors_offset;
-
-    let indices_offset = bin.len();
-    for i in &mesh.indices {
-        bin.extend_from_slice(&i.to_le_bytes());
-    }
-    let indices_len = bin.len() - indices_offset;
-
-    let (min, max) = positions_min_max(&mesh.positions);
 
     let root = GltfRoot {
         asset: GltfAsset { version: "2.0".to_string() },
-        scene: 0,
-        scenes: vec![GltfScene { nodes: vec![0] }],
-        nodes: vec![GltfNode { mesh: 0 }],
-        meshes: vec![GltfMesh {
-            primitives: vec![GltfPrimitive {
-                attributes: GltfAttributes { position: 0, normal: 1, color_0: 2 },
-                indices: 3,
-                mode: MODE_TRIANGLES,
-            }],
-        }],
+        buffers: vec![GltfBuffer { byte_length: bin_buffer.len() }],
+        buffer_views: vec![
+            GltfBufferView { buffer: 0, byte_offset: view_pos_offset, byte_length: view_pos_len, target: Some(34962) },
+            GltfBufferView { buffer: 0, byte_offset: view_norm_offset, byte_length: view_norm_len, target: Some(34962) },
+            GltfBufferView { buffer: 0, byte_offset: view_col_offset, byte_length: view_col_len, target: Some(34962) },
+            GltfBufferView { buffer: 0, byte_offset: view_idx_offset, byte_length: view_idx_len, target: Some(34963) },
+        ],
         accessors: vec![
             GltfAccessor {
                 buffer_view: 0,
-                component_type: COMPONENT_TYPE_FLOAT,
-                count: vertex_count,
+                component_type: 5126,
+                count: mesh.positions.len(),
                 kind: "VEC3".to_string(),
-                min: Some(min.to_vec()),
-                max: Some(max.to_vec()),
+                min: Some(min_pos.to_vec()),
+                max: Some(max_pos.to_vec()),
             },
             GltfAccessor {
                 buffer_view: 1,
-                component_type: COMPONENT_TYPE_FLOAT,
-                count: vertex_count,
+                component_type: 5126,
+                count: mesh.normals.len(),
                 kind: "VEC3".to_string(),
                 min: None,
                 max: None,
             },
             GltfAccessor {
                 buffer_view: 2,
-                component_type: COMPONENT_TYPE_FLOAT,
-                count: vertex_count,
+                component_type: 5126,
+                count: mesh.voxel_ids.len(),
                 kind: "VEC4".to_string(),
                 min: None,
                 max: None,
             },
             GltfAccessor {
                 buffer_view: 3,
-                component_type: COMPONENT_TYPE_UNSIGNED_INT,
+                component_type: 5125,
                 count: mesh.indices.len(),
                 kind: "SCALAR".to_string(),
                 min: None,
                 max: None,
             },
         ],
-        buffer_views: vec![
-            GltfBufferView {
-                buffer: 0,
-                byte_offset: positions_offset,
-                byte_length: positions_len,
-                target: Some(TARGET_ARRAY_BUFFER),
-            },
-            GltfBufferView {
-                buffer: 0,
-                byte_offset: normals_offset,
-                byte_length: normals_len,
-                target: Some(TARGET_ARRAY_BUFFER),
-            },
-            GltfBufferView {
-                buffer: 0,
-                byte_offset: colors_offset,
-                byte_length: colors_len,
-                target: Some(TARGET_ARRAY_BUFFER),
-            },
-            GltfBufferView {
-                buffer: 0,
-                byte_offset: indices_offset,
-                byte_length: indices_len,
-                target: Some(TARGET_ELEMENT_ARRAY_BUFFER),
-            },
-        ],
-        buffers: vec![GltfBuffer { byte_length: bin.len() }],
+        meshes: vec![GltfMesh {
+            primitives: vec![GltfMeshPrimitive {
+                attributes: GltfAttributes { position: 0, normal: 1, color_0: 2 },
+                indices: 3,
+                mode: 4,
+            }],
+        }],
+        nodes: vec![GltfNode { mesh: 0 }],
+        scenes: vec![GltfScene { nodes: vec![0] }],
+        scene: 0,
     };
 
-    let mut json = serde_json::to_vec(&root).expect("glTF JSON structure should always serialize");
-    while json.len() % 4 != 0 {
-        json.push(b' '); // GLB spec: JSON chunk is padded with spaces
-    }
-    while bin.len() % 4 != 0 {
-        bin.push(0); // GLB spec: BIN chunk is padded with zero bytes
+    let json_str = serde_json::to_string(&root).expect("serialize gltf json");
+    let mut json_bytes = json_str.into_bytes();
+    while json_bytes.len() % 4 != 0 {
+        json_bytes.push(0x20);
     }
 
-    let total_len = 12 + 8 + json.len() + 8 + bin.len();
+    let total_size = 12 + 8 + json_bytes.len() + 8 + bin_buffer.len();
+    let mut out = Vec::with_capacity(total_size);
 
-    let mut glb = Vec::with_capacity(total_len);
-    glb.extend_from_slice(b"glTF");
-    glb.extend_from_slice(&2u32.to_le_bytes());
-    glb.extend_from_slice(&(total_len as u32).to_le_bytes());
+    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&(total_size as u32).to_le_bytes());
 
-    glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    glb.extend_from_slice(b"JSON");
-    glb.extend_from_slice(&json);
+    out.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"JSON");
+    out.extend_from_slice(&json_bytes);
 
-    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
-    glb.extend_from_slice(b"BIN\0");
-    glb.extend_from_slice(&bin);
+    out.extend_from_slice(&(bin_buffer.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"BIN\0");
+    out.extend_from_slice(&bin_buffer);
 
-    glb
+    fs::write(path, out)?;
+    Ok(())
 }
 
-/// A mesh read back from a .glb file produced by `export_gltf_glb`.
-///
-/// This is a round-trip reader for *our own* exporter's output, not a
-/// general-purpose glTF importer -- it assumes exactly one buffer, one
-/// mesh, one primitive with POSITION/NORMAL/COLOR_0/indices, matching what
-/// `export_gltf_glb` always produces.
+#[derive(Debug, Clone)]
 pub struct ImportedMesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
@@ -273,61 +229,65 @@ pub struct ImportedMesh {
     pub indices: Vec<u32>,
 }
 
-fn read_f32(bytes: &[u8], offset: usize) -> f32 {
-    f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-
-pub fn import_gltf_glb(glb: &[u8]) -> Result<ImportedMesh, String> {
-    if glb.len() < 12 || &glb[0..4] != b"glTF" {
-        return Err("not a .glb file (bad magic)".to_string());
+pub fn import_gltf_glb(path: &Path) -> Result<ImportedMesh, String> {
+    let bytes = fs::read(path).map_err(|e| format!("failed to read file: {e}"))?;
+    if bytes.len() < 20 {
+        return Err("file too short to be a valid GLB".to_string());
     }
-    let total_len = read_u32(glb, 8) as usize;
-    if total_len != glb.len() {
-        return Err(format!("header length {total_len} doesn't match actual file size {}", glb.len()));
+    if &bytes[0..4] != b"glTF" {
+        return Err("magic bytes are not glTF".to_string());
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if version != 2 {
+        return Err(format!("unsupported glTF version: {version}"));
     }
 
-    let mut cursor = 12;
-    let mut json_bytes: Option<&[u8]> = None;
-    let mut bin_bytes: Option<&[u8]> = None;
-
-    while cursor + 8 <= glb.len() {
-        let chunk_len = read_u32(glb, cursor) as usize;
-        let chunk_type = &glb[cursor + 4..cursor + 8];
-        let data_start = cursor + 8;
-        let data_end = data_start + chunk_len;
-        if data_end > glb.len() {
-            return Err("chunk length runs past end of file".to_string());
-        }
-        let data = &glb[data_start..data_end];
-        if chunk_type == b"JSON" {
-            json_bytes = Some(data);
-        } else if chunk_type == b"BIN\0" {
-            bin_bytes = Some(data);
-        }
-        cursor = data_end;
+    let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let json_type = &bytes[16..20];
+    if json_type != b"JSON" {
+        return Err("first chunk is not JSON".to_string());
     }
 
-    let json_bytes = json_bytes.ok_or("missing JSON chunk")?;
-    let bin_bytes = bin_bytes.ok_or("missing BIN chunk")?;
+    let json_start = 20;
+    let json_end = json_start + json_len;
+    if json_end > bytes.len() {
+        return Err("JSON chunk extends past file boundary".to_string());
+    }
+    let json_slice = &bytes[json_start..json_end];
+    let root: GltfRoot = serde_json::from_slice(json_slice).map_err(|e| format!("failed to parse JSON: {e}"))?;
 
-    let root: GltfRoot = serde_json::from_slice(json_bytes).map_err(|e| format!("bad glTF JSON: {e}"))?;
+    let bin_header_start = json_end;
+    if bin_header_start + 8 > bytes.len() {
+        return Err("missing BIN chunk header".to_string());
+    }
+    let bin_len = u32::from_le_bytes(bytes[bin_header_start..bin_header_start + 4].try_into().unwrap()) as usize;
+    let bin_type = &bytes[bin_header_start + 4..bin_header_start + 8];
+    if bin_type != b"BIN\0" {
+        return Err("second chunk is not BIN".to_string());
+    }
 
-    let mesh = root.meshes.first().ok_or("no meshes in file")?;
-    let primitive = mesh.primitives.first().ok_or("mesh has no primitives")?;
+    let bin_start = bin_header_start + 8;
+    let bin_end = bin_start + bin_len;
+    if bin_end > bytes.len() {
+        return Err("BIN chunk extends past file boundary".to_string());
+    }
+    let bin_bytes = &bytes[bin_start..bin_end];
 
-    let read_vec_accessor = |accessor_index: u32, components: usize| -> Result<Vec<f32>, String> {
-        let accessor = root
-            .accessors
-            .get(accessor_index as usize)
-            .ok_or_else(|| format!("accessor {accessor_index} out of range"))?;
-        let view = root
-            .buffer_views
-            .get(accessor.buffer_view as usize)
-            .ok_or("bufferView out of range")?;
+    if root.meshes.is_empty() || root.meshes[0].primitives.is_empty() {
+        return Err("no mesh primitives found in GLB".to_string());
+    }
+    let primitive = &root.meshes[0].primitives[0];
+
+    let read_f32 = |buf: &[u8], offset: usize| -> f32 {
+        f32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    };
+    let read_u32 = |buf: &[u8], offset: usize| -> u32 {
+        u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    };
+
+    let read_vec_accessor = |accessor_idx: u32, components: usize| -> Result<Vec<f32>, String> {
+        let accessor = root.accessors.get(accessor_idx as usize).ok_or("accessor out of range")?;
+        let view = root.buffer_views.get(accessor.buffer_view as usize).ok_or("bufferView out of range")?;
         let mut out = Vec::with_capacity(accessor.count * components);
         for i in 0..accessor.count {
             for c in 0..components {
@@ -342,14 +302,8 @@ pub fn import_gltf_glb(glb: &[u8]) -> Result<ImportedMesh, String> {
     let flat_normals = read_vec_accessor(primitive.attributes.normal, 3)?;
     let flat_colors = read_vec_accessor(primitive.attributes.color_0, 4)?;
 
-    let indices_accessor = root
-        .accessors
-        .get(primitive.indices as usize)
-        .ok_or("indices accessor out of range")?;
-    let indices_view = root
-        .buffer_views
-        .get(indices_accessor.buffer_view as usize)
-        .ok_or("indices bufferView out of range")?;
+    let indices_accessor = root.accessors.get(primitive.indices as usize).ok_or("indices accessor out of range")?;
+    let indices_view = root.buffer_views.get(indices_accessor.buffer_view as usize).ok_or("indices bufferView out of range")?;
     let mut indices = Vec::with_capacity(indices_accessor.count);
     for i in 0..indices_accessor.count {
         indices.push(read_u32(bin_bytes, indices_view.byte_offset + i * 4));
@@ -360,4 +314,81 @@ pub fn import_gltf_glb(glb: &[u8]) -> Result<ImportedMesh, String> {
     let colors = flat_colors.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
 
     Ok(ImportedMesh { positions, normals, colors, indices })
+}
+
+/// New feature function: Exports the MeshData to standard split-material .obj and .mtl pairs.
+pub fn export_obj_mtl(mesh: &MeshData, base_path: &Path) -> io::Result<()> {
+    let obj_path = base_path.with_extension("obj");
+    let mtl_path = base_path.with_extension("mtl");
+    let mtl_filename = mtl_path.file_name().unwrap().to_string_lossy();
+
+    // 1. Write the .mtl file mapping palette material submeshes
+    let mut mtl_file = File::create(&mtl_path)?;
+    writeln!(mtl_file, "# Generated Material Library")?;
+    
+    let default_palette = [
+        (1, [0.93, 0.93, 0.94]), // White
+        (2, [0.92, 0.38, 0.38]), // Coral
+        (3, [0.95, 0.80, 0.25]), // Sun
+        (4, [0.35, 0.75, 0.40]), // Leaf
+        (5, [0.30, 0.55, 0.90]), // Sky
+        (6, [0.58, 0.38, 0.85]), // Grape
+        (7, [0.28, 0.28, 0.31]), // Charcoal
+        (8, [0.75, 0.42, 0.22]), // Rust
+    ];
+
+    for (id, rgb) in default_palette.iter() {
+        writeln!(mtl_file, "newmtl VoxelMat_{}", id)?;
+        writeln!(mtl_file, "Kd {} {} {}", rgb[0], rgb[1], rgb[2])?;
+        writeln!(mtl_file, "Illum 1")?;
+        writeln!(mtl_file, "Ka 0.2 0.2 0.2")?;
+        writeln!(mtl_file, "Ks 0.0 0.0 0.0")?;
+        writeln!(mtl_file, "")?;
+    }
+
+    // 2. Write the structural .obj file geometry layout descriptors
+    let mut obj_file = File::create(&obj_path)?;
+    writeln!(obj_file, "# Voxel Engine Export")?;
+    writeln!(obj_file, "mtllib {}", mtl_filename)?;
+    writeln!(obj_file, "")?;
+
+    for pos in &mesh.positions {
+        writeln!(obj_file, "v {} {} {}", pos[0], pos[1], pos[2])?;
+    }
+    writeln!(obj_file, "")?;
+
+    for norm in &mesh.normals {
+        writeln!(obj_file, "vn {} {} {}", norm[0], norm[1], norm[2])?;
+    }
+    writeln!(obj_file, "")?;
+
+    let quad_count = mesh.indices.len() / 6;
+    for (mat_id, _) in default_palette.iter() {
+        let mut written_mat_header = false;
+
+        for q in 0..quad_count {
+            let i0 = mesh.indices[q * 6] as usize;
+            let current_quad_mat = mesh.voxel_ids.get(i0).copied().unwrap_or(0);
+
+            if current_quad_mat == *mat_id {
+                if !written_mat_header {
+                    writeln!(obj_file, "usemtl VoxelMat_{}", mat_id)?;
+                    written_mat_header = true;
+                }
+
+                let t1_0 = mesh.indices[q * 6] + 1;
+                let t1_1 = mesh.indices[q * 6 + 1] + 1;
+                let t1_2 = mesh.indices[q * 6 + 2] + 1;
+                writeln!(obj_file, "f {}//{} {}//{} {}//{}", t1_0, t1_0, t1_1, t1_1, t1_2, t1_2)?;
+
+                let t2_0 = mesh.indices[q * 6 + 3] + 1;
+                let t2_1 = mesh.indices[q * 6 + 4] + 1;
+                let t2_2 = mesh.indices[q * 6 + 5] + 1;
+                writeln!(obj_file, "f {}//{} {}//{} {}//{}", t2_0, t2_0, t2_1, t2_1, t2_2, t2_2)?;
+            }
+        }
+    }
+
+    println!("Exported OBJ asset pair successfully.");
+    Ok(())
 }

@@ -2424,6 +2424,7 @@ name = "voxel_core"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "bytemuck",
  "glam",
  "serde",
  "serde_json",
