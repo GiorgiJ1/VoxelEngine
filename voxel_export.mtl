@@ -1,49 +1,37 @@
 # Generated Material Library
-newmtl VoxelMat_1
-Kd 0.93 0.93 0.94
-Illum 1
-Ka 0.2 0.2 0.2
-Ks 0.0 0.0 0.0
-
 newmtl VoxelMat_2
 Kd 0.92 0.38 0.38
-Illum 1
+illum 1
 Ka 0.2 0.2 0.2
 Ks 0.0 0.0 0.0
 
 newmtl VoxelMat_3
 Kd 0.95 0.8 0.25
-Illum 1
+illum 1
 Ka 0.2 0.2 0.2
 Ks 0.0 0.0 0.0
 
 newmtl VoxelMat_4
 Kd 0.35 0.75 0.4
-Illum 1
+illum 1
 Ka 0.2 0.2 0.2
 Ks 0.0 0.0 0.0
 
 newmtl VoxelMat_5
 Kd 0.3 0.55 0.9
-Illum 1
-Ka 0.2 0.2 0.2
-Ks 0.0 0.0 0.0
-
-newmtl VoxelMat_6
-Kd 0.58 0.38 0.85
-Illum 1
+illum 1
 Ka 0.2 0.2 0.2
 Ks 0.0 0.0 0.0
 
 newmtl VoxelMat_7
 Kd 0.28 0.28 0.31
-Illum 1
+illum 1
 Ka 0.2 0.2 0.2
 Ks 0.0 0.0 0.0
 
 newmtl VoxelMat_8
 Kd 0.75 0.42 0.22
-Illum 1
+illum 1
 Ka 0.2 0.2 0.2
 Ks 0.0 0.0 0.0
 
