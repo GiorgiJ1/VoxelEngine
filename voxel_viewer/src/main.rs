@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3, Vec4};
+use gltf::mesh;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -218,29 +219,39 @@ impl Gpu {
         }
     }
 
-    fn export(&self) {
-        let mesh = greedy_mesh(&self.chunk);
-        
+    /// Starting the line here
+    fn build_material_resolver(&self) -> [[f32; 3]; 256] {
         let mut resolver = [[0.5f32; 3]; 256];
         for m in &self.materials {
-            if (m.id as usize) < 256 {
+            if(m.id as usize) < 256
+            {
                 resolver[m.id as usize] = m.color;
             }
         }
-
-        match export_gltf_glb(&mesh, std::path::Path::new(Self::EXPORT_PATH), &resolver) {
-            Ok(()) => println!("exported glTF to {}", Self::EXPORT_PATH),
-            Err(e) => eprintln!("export glTF failed: {e}"),
-        }
+        resolver
     }
 
+    fn export(&self)
+    {
+        let mesh = greedy_mesh(&self.chunk);
+        let resolver = self.build_material_resolver();
+
+        match export_gltf_glb(&mesh, std::path::Path::new(Self::EXPORT_PATH), &resolver){
+            Ok(()) => println!("Exported the glTF to {}", Self::EXPORT_PATH),
+            Err(e) => eprintln!("export of the glTF failed: {e}"),
+        }
+    }
+    
     fn export_obj(&self) {
         let mesh = greedy_mesh(&self.chunk);
-        match export_obj_mtl(&mesh, std::path::Path::new(Self::OBJ_EXPORT_BASE)) {
+        let resolver = self.build_material_resolver();
+        match export_obj_mtl(&mesh, std::path::Path::new(Self::OBJ_EXPORT_BASE), &resolver) {
             Ok(()) => println!("exported OBJ/MTL group to {}.obj/.mtl", Self::OBJ_EXPORT_BASE),
             Err(e) => eprintln!("export OBJ failed: {e}"),
         }
     }
+
+    /// Ending the line here
 
     fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
