@@ -316,63 +316,68 @@ pub fn import_gltf_glb(path: &Path) -> Result<ImportedMesh, String> {
     Ok(ImportedMesh { positions, normals, colors, indices })
 }
 
-/// New feature function: Exports the MeshData to standard split-material .obj and .mtl pairs.
-pub fn export_obj_mtl(mesh: &MeshData, base_path: &Path) -> io::Result<()> {
+/// Exports the mesh to a classic split .obj + .mtl pair.
+///
+/// Takes the same `materials_resolver` shape as `export_gltf_glb` (rather
+/// than owning its own copy of the palette) and only emits materials that
+/// are actually present in `mesh.voxel_ids` -- derived from the mesh
+/// itself, not a fixed list. That matters: a hardcoded list of known ids
+/// would silently drop geometry for any material id it didn't know about
+/// (e.g. if the palette ever grows past whatever was hardcoded here).
+pub fn export_obj_mtl(mesh: &MeshData, base_path: &Path, materials_resolver: &[[f32; 3]; 256]) -> io::Result<()> {
     let obj_path = base_path.with_extension("obj");
     let mtl_path = base_path.with_extension("mtl");
     let mtl_filename = mtl_path.file_name().unwrap().to_string_lossy();
 
-    // 1. Write the .mtl file mapping palette material submeshes
+    let mut used_ids: Vec<u16> = mesh
+        .voxel_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    used_ids.sort_unstable();
+
+    // 1. Write the .mtl file, one entry per material actually used.
     let mut mtl_file = File::create(&mtl_path)?;
     writeln!(mtl_file, "# Generated Material Library")?;
-    
-    let default_palette = [
-        (1, [0.93, 0.93, 0.94]), // White
-        (2, [0.92, 0.38, 0.38]), // Coral
-        (3, [0.95, 0.80, 0.25]), // Sun
-        (4, [0.35, 0.75, 0.40]), // Leaf
-        (5, [0.30, 0.55, 0.90]), // Sky
-        (6, [0.58, 0.38, 0.85]), // Grape
-        (7, [0.28, 0.28, 0.31]), // Charcoal
-        (8, [0.75, 0.42, 0.22]), // Rust
-    ];
-
-    for (id, rgb) in default_palette.iter() {
-        writeln!(mtl_file, "newmtl VoxelMat_{}", id)?;
+    for id in &used_ids {
+        let rgb = materials_resolver[*id as usize];
+        writeln!(mtl_file, "newmtl VoxelMat_{id}")?;
         writeln!(mtl_file, "Kd {} {} {}", rgb[0], rgb[1], rgb[2])?;
-        writeln!(mtl_file, "Illum 1")?;
+        writeln!(mtl_file, "illum 1")?;
         writeln!(mtl_file, "Ka 0.2 0.2 0.2")?;
         writeln!(mtl_file, "Ks 0.0 0.0 0.0")?;
-        writeln!(mtl_file, "")?;
+        writeln!(mtl_file)?;
     }
 
-    // 2. Write the structural .obj file geometry layout descriptors
+    // 2. Write the .obj geometry, grouped by material.
     let mut obj_file = File::create(&obj_path)?;
     writeln!(obj_file, "# Voxel Engine Export")?;
-    writeln!(obj_file, "mtllib {}", mtl_filename)?;
-    writeln!(obj_file, "")?;
+    writeln!(obj_file, "mtllib {mtl_filename}")?;
+    writeln!(obj_file)?;
 
     for pos in &mesh.positions {
         writeln!(obj_file, "v {} {} {}", pos[0], pos[1], pos[2])?;
     }
-    writeln!(obj_file, "")?;
+    writeln!(obj_file)?;
 
     for norm in &mesh.normals {
         writeln!(obj_file, "vn {} {} {}", norm[0], norm[1], norm[2])?;
     }
-    writeln!(obj_file, "")?;
+    writeln!(obj_file)?;
 
     let quad_count = mesh.indices.len() / 6;
-    for (mat_id, _) in default_palette.iter() {
+    for id in &used_ids {
         let mut written_mat_header = false;
 
         for q in 0..quad_count {
             let i0 = mesh.indices[q * 6] as usize;
             let current_quad_mat = mesh.voxel_ids.get(i0).copied().unwrap_or(0);
 
-            if current_quad_mat == *mat_id {
+            if current_quad_mat == *id {
                 if !written_mat_header {
-                    writeln!(obj_file, "usemtl VoxelMat_{}", mat_id)?;
+                    writeln!(obj_file, "usemtl VoxelMat_{id}")?;
                     written_mat_header = true;
                 }
 
