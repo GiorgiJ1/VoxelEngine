@@ -1,8 +1,8 @@
 use std::sync::Arc;
+use std::path::PathBuf;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3, Vec4};
-use gltf::mesh;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -46,8 +46,6 @@ struct Uniforms {
     model: [[f32; 4]; 4],
 }
 
-/// Mouse-controlled orbit camera: left-drag rotates around `target`,
-/// scroll zooms in/out.
 struct Camera {
     target: Vec3,
     yaw: f32,
@@ -92,8 +90,6 @@ impl Default for Camera {
     }
 }
 
-/// Which effect a left-click has, matching the mockup's "Paint Mode" radio
-/// group. Right-click stays a quick-remove shortcut regardless of mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PaintMode {
     Add,
@@ -101,7 +97,6 @@ enum PaintMode {
     Remove,
 }
 
-/// A single entry in the artist's palette.
 #[derive(Clone)]
 struct Material {
     id: u16,
@@ -109,7 +104,6 @@ struct Material {
     color: [f32; 3],
 }
 
-/// Starting palette, matching the mockup's default 8 materials.
 fn default_materials() -> Vec<Material> {
     vec![
         Material { id: 1, name: "White", color: [0.93, 0.93, 0.94] },
@@ -131,24 +125,22 @@ fn material_color(materials: &[Material], id: u16) -> [f32; 3] {
         .unwrap_or([0.6, 0.6, 0.6])
 }
 
-/// Builds a tiny demo shape: a 4x4 "Leaf" platform, a "Rust" pillar,
-/// and a "Coral" cap on top -- used only when there's no save file yet.
 fn build_demo_chunk() -> Chunk {
     let mut chunk = Chunk::empty();
     for x in 0..4 {
         for z in 0..4 {
-            chunk.set(x, 0, z, Voxel::new(4)); // Leaf
+            chunk.set(x, 0, z, Voxel::new(4));
         }
     }
     for y in 1..4 {
-        chunk.set(1, y, 1, Voxel::new(8)); // Rust
+        chunk.set(1, y, 1, Voxel::new(8));
         chunk.set(2, y, 1, Voxel::new(8));
         chunk.set(1, y, 2, Voxel::new(8));
         chunk.set(2, y, 2, Voxel::new(8));
     }
     for x in 0..3 {
         for z in 0..3 {
-            chunk.set(x, 4, z, Voxel::new(2)); // Coral
+            chunk.set(x, 4, z, Voxel::new(2));
         }
     }
     chunk
@@ -191,20 +183,9 @@ struct Gpu {
     egui_ctx: egui::Context,
     egui_state: EguiState,
     egui_renderer: EguiRenderer,
-}
-
-fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("depth"),
-        size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
+    
+    // Unified Project Management State Tracking Variables
+    current_project_path: Option<PathBuf>,
 }
 
 impl Gpu {
@@ -219,7 +200,7 @@ impl Gpu {
         }
     }
 
-    /// Starting the line here
+        /// Starting the line here
     fn build_material_resolver(&self) -> [[f32; 3]; 256] {
         let mut resolver = [[0.5f32; 3]; 256];
         for m in &self.materials {
@@ -252,6 +233,91 @@ impl Gpu {
     }
 
     /// Ending the line here
+
+    fn file_new(&mut self) {
+        self.chunk = Chunk::empty();
+        self.current_project_path = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.rebuild_mesh();
+        println!("Created new empty project environment.");
+    }
+
+    fn file_open(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Voxel Project File (*.bin)", &["bin"])
+            .pick_file()
+        {
+            match load_chunk(&path) {
+                Ok(loaded_chunk) => {
+                    self.chunk = loaded_chunk;
+                    self.current_project_path = Some(path.clone());
+                    self.undo_stack.clear();
+                    self.redo_stack.clear();
+                    self.rebuild_mesh();
+                    println!("Project workspace loaded from: {:?}", path);
+                }
+                Err(e) => eprintln!("Failed to load project snapshot: {e}"),
+            }
+        }
+    }
+
+    fn file_save(&mut self) {
+        if self.current_project_path.is_some() {
+            let path = self.current_project_path.clone().unwrap();
+            self.perform_save_to_path(&path);
+        } else {
+            self.file_save_as();
+        }
+    }
+
+    fn file_save_as(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name("project.bin")
+            .add_filter("Voxel Project File (*.bin)", &["bin"])
+            .save_file()
+        {
+            self.perform_save_to_path(&path);
+            self.current_project_path = Some(path);
+        }
+    }
+
+    fn perform_save_to_path(&self, path: &std::path::Path) {
+        match save_chunk(&self.chunk, path) {
+            Ok(()) => println!("Project state written safely onto disk location: {:?}", path),
+            Err(e) => eprintln!("Failed to record workspace state layout: {e}"),
+        }
+    }
+
+    fn file_export_glb(&self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name("model_export.glb")
+            .add_filter("glTF 2.0 Binary Container (*.glb)", &["glb"])
+            .save_file()
+        {
+            let mesh = greedy_mesh(&self.chunk);
+            let resolver = self.build_material_resolver();
+            match export_gltf_glb(&mesh, &path, &resolver) {
+                Ok(()) => println!("Successfully generated glTF Asset payload at: {:?}", path),
+                Err(e) => eprintln!("glTF export compilation sequence failed: {e}"),
+            }
+        }
+    }
+
+    fn file_export_obj(&self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name("model_export")
+            .add_filter("Wavefront Structural Layout Bundle (*.obj)", &["obj"])
+            .save_file()
+        {
+            let mesh = greedy_mesh(&self.chunk);
+            let resolver = self.build_material_resolver();
+            match export_obj_mtl(&mesh, &path, &resolver) {
+                Ok(()) => println!("Successfully generated paired Wavefront OBJ/MTL target at: {:?}", path),
+                Err(e) => eprintln!("Wavefront pipeline export processing failed: {e}"),
+            }
+        }
+    }
 
     fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
@@ -375,16 +441,7 @@ impl Gpu {
             cache: None,
         });
 
-        let chunk = match load_chunk(std::path::Path::new(Gpu::SAVE_PATH)) {
-            Ok(c) => {
-                println!("loaded existing save from {}", Gpu::SAVE_PATH);
-                c
-            }
-            Err(e) => {
-                println!("no usable save file ({e}) -- starting from the demo shape");
-                build_demo_chunk()
-            }
-        };
+        let chunk = build_demo_chunk();
         let materials = default_materials();
         let mesh = greedy_mesh(&chunk);
         let vertices = mesh_to_vertices(&mesh, &materials);
@@ -399,13 +456,6 @@ impl Gpu {
             contents: bytemuck::cast_slice(&mesh.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-
-        println!(
-            "loaded mesh: {} quads, {} verts, {} tris",
-            mesh.quad_count(),
-            mesh.positions.len(),
-            mesh.triangle_count()
-        );
 
         let egui_ctx = egui::Context::default();
         let egui_state = EguiState::new(
@@ -446,6 +496,7 @@ impl Gpu {
             egui_ctx,
             egui_state,
             egui_renderer,
+            current_project_path: None,
         }
     }
 
@@ -592,7 +643,6 @@ impl Gpu {
 
     fn undo(&mut self) {
         let Some(prev_ids) = self.undo_stack.pop() else {
-            println!("nothing to undo");
             return;
         };
         self.redo_stack.push(self.chunk.to_ids());
@@ -604,7 +654,6 @@ impl Gpu {
 
     fn redo(&mut self) {
         let Some(next_ids) = self.redo_stack.pop() else {
-            println!("nothing to redo");
             return;
         };
         self.undo_stack.push(self.chunk.to_ids());
@@ -669,21 +718,33 @@ impl Gpu {
         let materials = self.materials.clone();
         let mut selected = self.current_material;
         let mut paint_mode = self.paint_mode;
-        let mut export_requested = false;
-        let mut export_obj_requested = false;
+        
+        // Unified UI Event Flags
+        let mut op_new = false;
+        let mut op_open = false;
+        let mut op_save = false;
+        let mut op_save_as = false;
+        let mut op_exp_glb = false;
+        let mut op_exp_obj = false;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             egui::SidePanel::right("materials_panel")
                 .resizable(false)
-                .default_width(220.0)
+                .default_width(240.0)
                 .show(ctx, |ui| {
+                    ui.heading("Project Workflow");
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("New").clicked() { op_new = true; }
+                        if ui.button("Open").clicked() { op_open = true; }
+                        if ui.button("Save").clicked() { op_save = true; }
+                        if ui.button("Save As").clicked() { op_save_as = true; }
+                    });
+                    
+                    ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Export .glb").clicked() {
-                            export_requested = true;
-                        }
-                        if ui.button("Export .obj").clicked() {
-                            export_obj_requested = true;
-                        }
+                        if ui.button("Export .glb").clicked() { op_exp_glb = true; }
+                        if ui.button("Export .obj").clicked() { op_exp_obj = true; }
                     });
                     ui.add_space(8.0);
 
@@ -715,20 +776,24 @@ impl Gpu {
                         });
                     }
                     ui.separator();
-                    let name = materials.iter().find(|m| m.id == selected).map(|m| m.name).unwrap_or("?");
-                    ui.label(format!("Selected material: {name}"));
-                    ui.add_space(12.0);
-                    ui.label("Ctrl+S save · Ctrl+E export · Ctrl+Z undo · Ctrl+Shift+Z redo");
+                    let file_lbl = match &self.current_project_path {
+                        Some(p) => p.file_name().unwrap().to_string_lossy().into_owned(),
+                        None => "Unsaved Project".to_string(),
+                    };
+                    ui.label(format!("Active File: {file_lbl}"));
                 });
         });
+        
         self.current_material = selected;
         self.paint_mode = paint_mode;
-        if export_requested {
-            self.export();
-        }
-        if export_obj_requested {
-            self.export_obj();
-        }
+        
+        // Execute Action Requests
+        if op_new { self.file_new(); }
+        if op_open { self.file_open(); }
+        if op_save { self.file_save(); }
+        if op_save_as { self.file_save_as(); }
+        if op_exp_glb { self.file_export_glb(); }
+        if op_exp_obj { self.file_export_obj(); }
 
         self.egui_state.handle_platform_output(&*self.window, full_output.platform_output);
         let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -780,7 +845,7 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
-        let window_attrs = Window::default_attributes().with_title("Voxel Engine - viewer v1");
+        let window_attrs = Window::default_attributes().with_title("Voxel Engine Sandbox Studio");
         let window = Arc::new(event_loop.create_window(window_attrs).expect("create window"));
         self.gpu = Some(Gpu::new(window));
     }
@@ -816,8 +881,8 @@ impl ApplicationHandler for App {
                             KeyCode::Digit1 => gpu.set_material(1),
                             KeyCode::Digit2 => gpu.set_material(2),
                             KeyCode::Digit3 => gpu.set_material(3),
-                            KeyCode::KeyS if gpu.modifiers.control_key() => gpu.save(),
-                            KeyCode::KeyE if gpu.modifiers.control_key() => gpu.export(),
+                            KeyCode::KeyS if gpu.modifiers.control_key() => gpu.file_save(),
+                            KeyCode::KeyE if gpu.modifiers.control_key() => gpu.file_export_glb(),
                             KeyCode::KeyZ if gpu.modifiers.control_key() && gpu.modifiers.shift_key() => gpu.redo(),
                             KeyCode::KeyZ if gpu.modifiers.control_key() => gpu.undo(),
                             KeyCode::KeyY if gpu.modifiers.control_key() => gpu.redo(),
@@ -846,4 +911,24 @@ fn main() {
     let event_loop = EventLoop::new().expect("create event loop");
     let mut app = App::default();
     event_loop.run_app(&mut app).expect("run app");
+}
+
+fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+    let size = wgpu::Extent3d {
+        width: config.width.max(1),
+        height: config.height.max(1),
+        depth_or_array_layers: 1,
+    };
+    let desc = wgpu::TextureDescriptor {
+        label: Some("depth_texture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    };
+    let texture = device.create_texture(&desc);
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
