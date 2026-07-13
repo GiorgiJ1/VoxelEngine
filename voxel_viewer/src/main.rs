@@ -271,16 +271,35 @@ impl Gpu {
         }
     }
 
-    fn file_save_as(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .set_file_name("project.bin")
-            .add_filter("Voxel Project File (*.bin)", &["bin"])
-            .save_file()
-        {
-            self.perform_save_to_path(&path);
-            self.current_project_path = Some(path);
+fn file_save_as(&mut self) {
+    if let Some(path) = rfd::FileDialog::new()
+        .set_file_name("project")
+        .add_filter("Voxel Project File (*.bin)", &["bin"])
+        .add_filter("glTF 2.0 Binary Container (*.glb)", &["glb"])
+        .add_filter("Wavefront Structural Layout (*.obj)", &["obj"])
+        .save_file()
+    {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            match ext.to_lowercase().as_str() {
+                "bin" => {
+                    self.perform_save_to_path(&path);
+                    self.current_project_path = Some(path);
+                }
+                "glb" => {
+                    let mesh = greedy_mesh(&self.chunk);
+                    let resolver = self.build_material_resolver();
+                    let _ = export_gltf_glb(&mesh, &path, &resolver);
+                }
+                "obj" => {
+                    let mesh = greedy_mesh(&self.chunk);
+                    let resolver = self.build_material_resolver();
+                    let _ = export_obj_mtl(&mesh, &path, &resolver);
+                }
+                _ => {}
+            }
         }
     }
+}
 
     fn perform_save_to_path(&self, path: &std::path::Path) {
         match save_chunk(&self.chunk, path) {
@@ -881,7 +900,16 @@ impl ApplicationHandler for App {
                             KeyCode::Digit1 => gpu.set_material(1),
                             KeyCode::Digit2 => gpu.set_material(2),
                             KeyCode::Digit3 => gpu.set_material(3),
-                            KeyCode::KeyS if gpu.modifiers.control_key() => gpu.file_save(),
+                            
+                            // Updated KeyS logic to handle both Ctrl+S and Ctrl+Shift+S
+                            KeyCode::KeyS if gpu.modifiers.control_key() => {
+                                if gpu.modifiers.shift_key() {
+                                    gpu.file_save_as(); // Opens native dialog for .bin, .obj, or .glb
+                                } else {
+                                    gpu.file_save();    // Quick saves to existing path or fallback
+                                }
+                            }
+                            
                             KeyCode::KeyE if gpu.modifiers.control_key() => gpu.file_export_glb(),
                             KeyCode::KeyZ if gpu.modifiers.control_key() && gpu.modifiers.shift_key() => gpu.redo(),
                             KeyCode::KeyZ if gpu.modifiers.control_key() => gpu.undo(),
