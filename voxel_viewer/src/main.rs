@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3, Vec4};
@@ -82,10 +83,10 @@ impl Camera {
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            target: Vec3::new(2.0, 1.5, 2.0),
+            target: Vec3::new((CHUNK_SIZE / 2) as f32, 0.0, (CHUNK_SIZE / 2) as f32),
             yaw: 45f32.to_radians(),
             pitch: 30f32.to_radians(),
-            distance: 10.0,
+            distance: 24.0,
         }
     }
 }
@@ -102,18 +103,20 @@ struct Material {
     id: u16,
     name: &'static str,
     color: [f32; 3],
+    opacity_pct: f32,
+    metallic_pct: f32,
 }
 
 fn default_materials() -> Vec<Material> {
     vec![
-        Material { id: 1, name: "White", color: [0.93, 0.93, 0.94] },
-        Material { id: 2, name: "Coral", color: [0.92, 0.38, 0.38] },
-        Material { id: 3, name: "Sun", color: [0.95, 0.80, 0.25] },
-        Material { id: 4, name: "Leaf", color: [0.35, 0.75, 0.40] },
-        Material { id: 5, name: "Sky", color: [0.30, 0.55, 0.90] },
-        Material { id: 6, name: "Grape", color: [0.58, 0.38, 0.85] },
-        Material { id: 7, name: "Charcoal", color: [0.28, 0.28, 0.31] },
-        Material { id: 8, name: "Rust", color: [0.75, 0.42, 0.22] },
+        Material { id: 1, name: "White", color: [0.93, 0.93, 0.94], opacity_pct: 100.0, metallic_pct: 0.0 },
+        Material { id: 2, name: "Coral", color: [0.92, 0.38, 0.38], opacity_pct: 100.0, metallic_pct: 0.0 },
+        Material { id: 3, name: "Sun", color: [0.95, 0.80, 0.25], opacity_pct: 100.0, metallic_pct: 0.0 },
+        Material { id: 4, name: "Leaf", color: [0.35, 0.75, 0.40], opacity_pct: 100.0, metallic_pct: 0.0 },
+        Material { id: 5, name: "Sky", color: [0.30, 0.55, 0.90], opacity_pct: 100.0, metallic_pct: 0.0 },
+        Material { id: 6, name: "Grape", color: [0.58, 0.38, 0.85], opacity_pct: 100.0, metallic_pct: 0.0 },
+        Material { id: 7, name: "Charcoal", color: [0.28, 0.28, 0.31], opacity_pct: 100.0, metallic_pct: 0.0 },
+        Material { id: 8, name: "Rust", color: [0.75, 0.42, 0.22], opacity_pct: 100.0, metallic_pct: 0.0 },
     ]
 }
 
@@ -146,13 +149,33 @@ fn build_demo_chunk() -> Chunk {
     chunk
 }
 
-fn mesh_to_vertices(mesh: &MeshData, materials: &[Material]) -> Vec<Vertex> {
-    mesh.positions
+fn append_grid_geometry(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
+    let start_idx = vertices.len() as u32;
+    let extent = 64.0; // Defines spatial domain boundary for grid projection layout
+    
+    // Low-overhead quad positioned at ground plane (y=0) to receive the procedural shader grid
+    vertices.push(Vertex { position: [-extent, 0.0, -extent], normal: [0.0, 1.0, 0.0], color: [0.14, 0.15, 0.17] });
+    vertices.push(Vertex { position: [ extent, 0.0, -extent], normal: [0.0, 1.0, 0.0], color: [0.14, 0.15, 0.17] });
+    vertices.push(Vertex { position: [ extent, 0.0,  extent], normal: [0.0, 1.0, 0.0], color: [0.14, 0.15, 0.17] });
+    vertices.push(Vertex { position: [-extent, 0.0,  extent], normal: [0.0, 1.0, 0.0], color: [0.14, 0.15, 0.17] });
+
+    indices.extend_from_slice(&[
+        start_idx, start_idx + 2, start_idx + 1,
+        start_idx, start_idx + 3, start_idx + 2,
+    ]);
+}
+
+fn mesh_to_vertices(mesh: &MeshData, materials: &[Material]) -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices: Vec<Vertex> = mesh.positions
         .iter()
         .zip(mesh.normals.iter())
         .zip(mesh.voxel_ids.iter())
         .map(|((p, n), id)| Vertex { position: *p, normal: *n, color: material_color(materials, *id) })
-        .collect()
+        .collect();
+
+    let mut indices = mesh.indices.clone();
+    append_grid_geometry(&mut vertices, &mut indices);
+    (vertices, indices)
 }
 
 struct Gpu {
@@ -183,9 +206,14 @@ struct Gpu {
     egui_ctx: egui::Context,
     egui_state: EguiState,
     egui_renderer: EguiRenderer,
-    
-    // Unified Project Management State Tracking Variables
     current_project_path: Option<PathBuf>,
+    brush_size: i32,
+    mirror_x: bool,
+    mirror_y: bool,
+    mirror_z: bool,
+    last_frame_instant: Instant,
+    fps: f32,
+    last_mesh_build_ms: f32,
 }
 
 impl Gpu {
@@ -200,24 +228,20 @@ impl Gpu {
         }
     }
 
-        /// Starting the line here
     fn build_material_resolver(&self) -> [[f32; 3]; 256] {
         let mut resolver = [[0.5f32; 3]; 256];
         for m in &self.materials {
-            if(m.id as usize) < 256
-            {
+            if (m.id as usize) < 256 {
                 resolver[m.id as usize] = m.color;
             }
         }
         resolver
     }
 
-    fn export(&self)
-    {
+    fn export(&self) {
         let mesh = greedy_mesh(&self.chunk);
         let resolver = self.build_material_resolver();
-
-        match export_gltf_glb(&mesh, std::path::Path::new(Self::EXPORT_PATH), &resolver){
+        match export_gltf_glb(&mesh, std::path::Path::new(Self::EXPORT_PATH), &resolver) {
             Ok(()) => println!("Exported the glTF to {}", Self::EXPORT_PATH),
             Err(e) => eprintln!("export of the glTF failed: {e}"),
         }
@@ -232,15 +256,12 @@ impl Gpu {
         }
     }
 
-    /// Ending the line here
-
     fn file_new(&mut self) {
         self.chunk = Chunk::empty();
         self.current_project_path = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.rebuild_mesh();
-        println!("Created new empty project environment.");
     }
 
     fn file_open(&mut self) {
@@ -248,16 +269,12 @@ impl Gpu {
             .add_filter("Voxel Project File (*.bin)", &["bin"])
             .pick_file()
         {
-            match load_chunk(&path) {
-                Ok(loaded_chunk) => {
-                    self.chunk = loaded_chunk;
-                    self.current_project_path = Some(path.clone());
-                    self.undo_stack.clear();
-                    self.redo_stack.clear();
-                    self.rebuild_mesh();
-                    println!("Project workspace loaded from: {:?}", path);
-                }
-                Err(e) => eprintln!("Failed to load project snapshot: {e}"),
+            if let Ok(loaded_chunk) = load_chunk(&path) {
+                self.chunk = loaded_chunk;
+                self.current_project_path = Some(path);
+                self.undo_stack.clear();
+                self.redo_stack.clear();
+                self.rebuild_mesh();
             }
         }
     }
@@ -271,41 +288,38 @@ impl Gpu {
         }
     }
 
-fn file_save_as(&mut self) {
-    if let Some(path) = rfd::FileDialog::new()
-        .set_file_name("project")
-        .add_filter("Voxel Project File (*.bin)", &["bin"])
-        .add_filter("glTF 2.0 Binary Container (*.glb)", &["glb"])
-        .add_filter("Wavefront Structural Layout (*.obj)", &["obj"])
-        .save_file()
-    {
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            match ext.to_lowercase().as_str() {
-                "bin" => {
-                    self.perform_save_to_path(&path);
-                    self.current_project_path = Some(path);
+    fn file_save_as(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name("project")
+            .add_filter("Voxel Project File (*.bin)", &["bin"])
+            .add_filter("glTF 2.0 Binary Container (*.glb)", &["glb"])
+            .add_filter("Wavefront Structural Layout (*.obj)", &["obj"])
+            .save_file()
+        {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                match ext.to_lowercase().as_str() {
+                    "bin" => {
+                        self.perform_save_to_path(&path);
+                        self.current_project_path = Some(path);
+                    }
+                    "glb" => {
+                        let mesh = greedy_mesh(&self.chunk);
+                        let resolver = self.build_material_resolver();
+                        let _ = export_gltf_glb(&mesh, &path, &resolver);
+                    }
+                    "obj" => {
+                        let mesh = greedy_mesh(&self.chunk);
+                        let resolver = self.build_material_resolver();
+                        let _ = export_obj_mtl(&mesh, &path, &resolver);
+                    }
+                    _ => {}
                 }
-                "glb" => {
-                    let mesh = greedy_mesh(&self.chunk);
-                    let resolver = self.build_material_resolver();
-                    let _ = export_gltf_glb(&mesh, &path, &resolver);
-                }
-                "obj" => {
-                    let mesh = greedy_mesh(&self.chunk);
-                    let resolver = self.build_material_resolver();
-                    let _ = export_obj_mtl(&mesh, &path, &resolver);
-                }
-                _ => {}
             }
         }
     }
-}
 
     fn perform_save_to_path(&self, path: &std::path::Path) {
-        match save_chunk(&self.chunk, path) {
-            Ok(()) => println!("Project state written safely onto disk location: {:?}", path),
-            Err(e) => eprintln!("Failed to record workspace state layout: {e}"),
-        }
+        let _ = save_chunk(&self.chunk, path);
     }
 
     fn file_export_glb(&self) {
@@ -316,10 +330,7 @@ fn file_save_as(&mut self) {
         {
             let mesh = greedy_mesh(&self.chunk);
             let resolver = self.build_material_resolver();
-            match export_gltf_glb(&mesh, &path, &resolver) {
-                Ok(()) => println!("Successfully generated glTF Asset payload at: {:?}", path),
-                Err(e) => eprintln!("glTF export compilation sequence failed: {e}"),
-            }
+            let _ = export_gltf_glb(&mesh, &path, &resolver);
         }
     }
 
@@ -331,16 +342,12 @@ fn file_save_as(&mut self) {
         {
             let mesh = greedy_mesh(&self.chunk);
             let resolver = self.build_material_resolver();
-            match export_obj_mtl(&mesh, &path, &resolver) {
-                Ok(()) => println!("Successfully generated paired Wavefront OBJ/MTL target at: {:?}", path),
-                Err(e) => eprintln!("Wavefront pipeline export processing failed: {e}"),
-            }
+            let _ = export_obj_mtl(&mesh, &path, &resolver);
         }
     }
 
     fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
-
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone()).expect("create surface");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -445,7 +452,7 @@ fn file_save_as(&mut self) {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None, // Set to None so grid and block undersides don't cull out prematurely
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -462,8 +469,10 @@ fn file_save_as(&mut self) {
 
         let chunk = build_demo_chunk();
         let materials = default_materials();
+        let initial_build_start = Instant::now();
         let mesh = greedy_mesh(&chunk);
-        let vertices = mesh_to_vertices(&mesh, &materials);
+        let (vertices, indices) = mesh_to_vertices(&mesh, &materials);
+        let initial_mesh_build_ms = initial_build_start.elapsed().as_secs_f32() * 1000.0;
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex_buffer"),
@@ -472,11 +481,20 @@ fn file_save_as(&mut self) {
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("index_buffer"),
-            contents: bytemuck::cast_slice(&mesh.indices),
+            contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
 
         let egui_ctx = egui::Context::default();
+        
+        let mut visuals = egui::Visuals::dark();
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(26, 27, 30);
+        visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(26, 27, 30);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 45, 48));
+        visuals.window_fill = egui::Color32::from_rgb(22, 23, 25);
+        visuals.panel_fill = egui::Color32::from_rgb(22, 23, 25);
+        egui_ctx.set_visuals(visuals);
+
         let egui_state = EguiState::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -496,7 +514,7 @@ fn file_save_as(&mut self) {
             depth_view,
             vertex_buffer,
             index_buffer,
-            num_indices: mesh.indices.len() as u32,
+            num_indices: indices.len() as u32,
             uniform_buffer,
             bind_group,
             window,
@@ -516,13 +534,18 @@ fn file_save_as(&mut self) {
             egui_state,
             egui_renderer,
             current_project_path: None,
+            brush_size: 1,
+            mirror_x: false,
+            mirror_y: false,
+            mirror_z: false,
+            last_frame_instant: Instant::now(),
+            fps: 0.0,
+            last_mesh_build_ms: initial_mesh_build_ms,
         }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
+        if width == 0 || height == 0 { return; }
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
@@ -532,7 +555,6 @@ fn file_save_as(&mut self) {
     fn update_uniforms(&self) {
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         let view_proj = self.camera.view_proj(aspect);
-
         let uniforms = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
             model: Mat4::IDENTITY.to_cols_array_2d(),
@@ -544,14 +566,21 @@ fn file_save_as(&mut self) {
 
     fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
         match button {
-            MouseButton::Left => {
+            // FIX: Middle Mouse Button (Scroll wheel click) handles looking around / camera orbit operations
+            MouseButton::Middle => {
                 if state == ElementState::Pressed {
                     self.dragging = true;
                     self.drag_last = Some(self.cursor_pos);
-                    self.press_pos = Some(self.cursor_pos);
                 } else {
                     self.dragging = false;
                     self.drag_last = None;
+                }
+            }
+            // Left click triggers structural canvas alterations exclusively
+            MouseButton::Left => {
+                if state == ElementState::Pressed {
+                    self.press_pos = Some(self.cursor_pos);
+                } else if state == ElementState::Released {
                     if let Some(press) = self.press_pos.take() {
                         let moved = ((self.cursor_pos.0 - press.0).powi(2)
                             + (self.cursor_pos.1 - press.1).powi(2))
@@ -592,8 +621,9 @@ fn file_save_as(&mut self) {
     }
 
     fn set_material(&mut self, id: u16) {
-        self.current_material = id;
-        println!("current material: {id}");
+        if id > 0 && id <= 8 {
+            self.current_material = id;
+        }
     }
 
     fn cursor_ray(&self, x: f64, y: f64) -> (Vec3, Vec3) {
@@ -601,15 +631,12 @@ fn file_save_as(&mut self) {
         let height = self.config.height.max(1) as f32;
         let ndc_x = (2.0 * x as f32 / width) - 1.0;
         let ndc_y = 1.0 - (2.0 * y as f32 / height);
-
         let aspect = width / height;
         let inv_vp = self.camera.view_proj(aspect).inverse();
-
         let near = inv_vp * Vec4::new(ndc_x, ndc_y, -1.0, 1.0);
         let far = inv_vp * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
         let near_world = near.truncate() / near.w;
         let far_world = far.truncate() / far.w;
-
         (near_world, (far_world - near_world).normalize())
     }
 
@@ -632,9 +659,7 @@ fn file_save_as(&mut self) {
 
         let Some((pos, new_voxel)) = target else { return };
         let current = self.chunk.get(pos.x as usize, pos.y as usize, pos.z as usize);
-        if current == new_voxel {
-            return;
-        }
+        if current == new_voxel { return; }
 
         self.push_undo_snapshot();
         self.chunk.set(pos.x as usize, pos.y as usize, pos.z as usize, new_voxel);
@@ -645,8 +670,7 @@ fn file_save_as(&mut self) {
         let (origin, dir) = self.cursor_ray(x, y);
         let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
         self.push_undo_snapshot();
-        self.chunk
-            .set(hit.voxel.x as usize, hit.voxel.y as usize, hit.voxel.z as usize, Voxel::EMPTY);
+        self.chunk.set(hit.voxel.x as usize, hit.voxel.y as usize, hit.voxel.z as usize, Voxel::EMPTY);
         self.rebuild_mesh();
     }
 
@@ -661,9 +685,7 @@ fn file_save_as(&mut self) {
     }
 
     fn undo(&mut self) {
-        let Some(prev_ids) = self.undo_stack.pop() else {
-            return;
-        };
+        let Some(prev_ids) = self.undo_stack.pop() else { return; };
         self.redo_stack.push(self.chunk.to_ids());
         if let Some(restored) = Chunk::from_ids(&prev_ids) {
             self.chunk = restored;
@@ -672,9 +694,7 @@ fn file_save_as(&mut self) {
     }
 
     fn redo(&mut self) {
-        let Some(next_ids) = self.redo_stack.pop() else {
-            return;
-        };
+        let Some(next_ids) = self.redo_stack.pop() else { return; };
         self.undo_stack.push(self.chunk.to_ids());
         if let Some(restored) = Chunk::from_ids(&next_ids) {
             self.chunk = restored;
@@ -683,8 +703,9 @@ fn file_save_as(&mut self) {
     }
 
     fn rebuild_mesh(&mut self) {
+        let build_start = Instant::now();
         let mesh = greedy_mesh(&self.chunk);
-        let vertices = mesh_to_vertices(&mesh, &self.materials);
+        let (vertices, indices) = mesh_to_vertices(&mesh, &self.materials);
 
         self.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex_buffer"),
@@ -693,13 +714,42 @@ fn file_save_as(&mut self) {
         });
         self.index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("index_buffer"),
-            contents: bytemuck::cast_slice(&mesh.indices),
+            contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        self.num_indices = mesh.indices.len() as u32;
+        self.num_indices = indices.len() as u32;
+        self.last_mesh_build_ms = build_start.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    fn clear_chunk(&mut self) {
+        self.push_undo_snapshot();
+        self.chunk = Chunk::empty();
+        self.rebuild_mesh();
+    }
+
+    fn voxel_count(&self) -> usize {
+        let mut count = 0;
+        for x in 0..CHUNK_SIZE {
+            for y in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    if !self.chunk.get(x, y, z).is_empty() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame_instant).as_secs_f32();
+        self.last_frame_instant = now;
+        if dt > 0.0 {
+            let instant_fps = 1.0 / dt;
+            self.fps = if self.fps == 0.0 { instant_fps } else { self.fps * 0.9 + instant_fps * 0.1 };
+        }
+
         self.update_uniforms();
 
         let frame = self.surface.get_current_texture()?;
@@ -713,7 +763,7 @@ fn file_save_as(&mut self) {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.08, g: 0.09, b: 0.11, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.11, g: 0.12, b: 0.14, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -734,85 +784,251 @@ fn file_save_as(&mut self) {
         }
 
         let raw_input = self.egui_state.take_egui_input(&*self.window);
-        let materials = self.materials.clone();
         let mut selected = self.current_material;
         let mut paint_mode = self.paint_mode;
-        
-        // Unified UI Event Flags
+        let mut brush_size = self.brush_size;
+        let mut mirror_x = self.mirror_x;
+        let mut mirror_y = self.mirror_y;
+        let mut mirror_z = self.mirror_z;
+        let voxel_count = self.voxel_count();
+        let fps = self.fps;
+        let mesh_build_ms = self.last_mesh_build_ms;
+        let file_label = match &self.current_project_path {
+            Some(p) => p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "unsaved_project.bin".to_string()),
+            None => "unsaved_project.bin".to_string(),
+        };
+
         let mut op_new = false;
         let mut op_open = false;
         let mut op_save = false;
         let mut op_save_as = false;
         let mut op_exp_glb = false;
         let mut op_exp_obj = false;
+        let mut op_clear = false;
+        let mut op_undo = false;
+        let mut op_redo = false;
+
+        let mut materials_edit = self.materials.clone();
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            egui::SidePanel::right("materials_panel")
-                .resizable(false)
-                .default_width(240.0)
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
                 .show(ctx, |ui| {
-                    ui.heading("Project Workflow");
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("New").clicked() { op_new = true; }
-                        if ui.button("Open").clicked() { op_open = true; }
-                        if ui.button("Save").clicked() { op_save = true; }
-                        if ui.button("Save As").clicked() { op_save_as = true; }
-                    });
                     
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Export .glb").clicked() { op_exp_glb = true; }
-                        if ui.button("Export .obj").clicked() { op_exp_obj = true; }
+                    // --- TOP APPLICATION MENU BAR ---
+                    let top_rect = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(ui.max_rect().width(), 26.0));
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top_rect), |ui| {
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(30, 31, 34))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 46, 50)))
+                            .show(ui, |ui| {
+                                ui.set_min_height(26.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(6.0);
+                                    ui.menu_button("File", |ui| {
+                                        if ui.button("New").clicked() { op_new = true; ui.close_menu(); }
+                                        if ui.button("Open...").clicked() { op_open = true; ui.close_menu(); }
+                                        if ui.button("Save").clicked() { op_save = true; ui.close_menu(); }
+                                        if ui.button("Save As...").clicked() { op_save_as = true; ui.close_menu(); }
+                                        ui.separator();
+                                        ui.menu_button("Export", |ui| {
+                                            if ui.button(".glb").clicked() { op_exp_glb = true; ui.close_menu(); }
+                                            if ui.button(".obj").clicked() { op_exp_obj = true; ui.close_menu(); }
+                                        });
+                                    });
+                                    ui.menu_button("Selection", |_| {});
+                                    ui.menu_button("Viewport", |_| {});
+                                    ui.menu_button("Help", |_| {});
+                                });
+                            });
                     });
-                    ui.add_space(8.0);
 
-                    ui.heading("Paint Mode");
-                    ui.separator();
-                    ui.radio_value(&mut paint_mode, PaintMode::Add, "Add Voxels");
-                    ui.radio_value(&mut paint_mode, PaintMode::Replace, "Replace Material");
-                    ui.radio_value(&mut paint_mode, PaintMode::Remove, "Remove Voxels");
+                    // --- LEFT HUD TOOLBAR PANEL ---
+                    let left_rect = egui::Rect::from_min_size(
+                        ui.max_rect().min + egui::vec2(10.0, 36.0),
+                        egui::vec2(190.0, ui.max_rect().height() - 72.0)
+                    );
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgba_unmultiplied(20, 21, 23, 235))
+                            .rounding(4.0)
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(60, 60, 65, 255)))
+                            .inner_margin(10.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("TOOLS & MODIFIERS").strong().color(egui::Color32::from_rgb(200, 200, 205)));
+                                ui.separator();
+                                
+                                ui.add_space(4.0);
+                                ui.label("Interaction Mode");
+                                ui.horizontal(|ui| {
+                                    if ui.selectable_label(paint_mode == PaintMode::Add, "Draw").clicked() { paint_mode = PaintMode::Add; }
+                                    if ui.selectable_label(paint_mode == PaintMode::Replace, "Add").clicked() { paint_mode = PaintMode::Replace; }
+                                    if ui.selectable_label(paint_mode == PaintMode::Remove, "⌫").clicked() { paint_mode = PaintMode::Remove; }
+                                });
 
-                    ui.add_space(12.0);
-                    ui.heading("Materials");
-                    ui.separator();
-                    for m in &materials {
-                        let is_selected = m.id == selected;
-                        let swatch = egui::Color32::from_rgb(
-                            (m.color[0] * 255.0) as u8,
-                            (m.color[1] * 255.0) as u8,
-                            (m.color[2] * 255.0) as u8,
-                        );
-                        ui.horizontal(|ui| {
-                            let (rect, swatch_response) =
-                                ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                            ui.painter().rect_filled(rect, 3.0, swatch);
-                            let label_response =
-                                ui.selectable_label(is_selected, format!("{}  #{:02}", m.name, m.id));
-                            if swatch_response.clicked() || label_response.clicked() {
-                                selected = m.id;
-                            }
+                                ui.add_space(8.0);
+                                ui.label(format!("Brush Size: {}x{}x{}", brush_size, brush_size, brush_size));
+                                ui.add(egui::Slider::new(&mut brush_size, 1..=7).step_by(2.0).show_value(false));
+
+                                ui.add_space(8.0);
+                                ui.label("Symmetry");
+                                ui.checkbox(&mut mirror_x, "Mirror X");
+                                ui.checkbox(&mut mirror_y, "Mirror Y");
+                                ui.checkbox(&mut mirror_z, "Mirror Z");
+                            });
+                    });
+
+                    // --- RIGHT HUD STUDIO PANEL ---
+                    let right_rect = egui::Rect::from_min_size(
+                        egui::pos2(ui.max_rect().max.x - 250.0, ui.max_rect().min.y + 36.0),
+                        egui::vec2(240.0, ui.max_rect().height() - 72.0)
+                    );
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgba_unmultiplied(20, 21, 23, 235))
+                            .rounding(4.0)
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(60, 60, 65, 255)))
+                            .inner_margin(10.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("MATERIAL PALETTE").strong().color(egui::Color32::from_rgb(200, 200, 205)));
+                                ui.separator();
+
+                                let active_color = material_color(&materials_edit, selected);
+                                let active_name = materials_edit.iter().find(|m| m.id == selected).map(|m| m.name).unwrap_or("Sky");
+                                ui.horizontal(|ui| {
+                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(
+                                        rect, 3.0,
+                                        egui::Color32::from_rgb(
+                                            (active_color[0] * 255.0) as u8,
+                                            (active_color[1] * 255.0) as u8,
+                                            (active_color[2] * 255.0) as u8,
+                                        ),
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.label(format!("#{selected:02}"));
+                                        ui.label(egui::RichText::new(active_name).heading().size(14.0));
+                                    });
+                                });
+
+                                ui.add_space(8.0);
+                                
+                                egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                                    egui::Grid::new("swatch_grid").spacing(egui::vec2(3.0, 3.0)).show(ui, |ui| {
+                                        for row in 0..16u16 {
+                                            for col in 0..16u16 {
+                                                let id = row * 16 + col;
+                                                if id == 0 {
+                                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(11.0, 11.0), egui::Sense::hover());
+                                                    ui.painter().rect_filled(rect, 1.0, egui::Color32::from_gray(35));
+                                                } else {
+                                                    let known = materials_edit.iter().find(|m| m.id == id);
+                                                    let color = known.map(|m| m.color).unwrap_or([0.2, 0.22, 0.25]);
+                                                    let (rect, response) = ui.allocate_exact_size(egui::vec2(11.0, 11.0), egui::Sense::click());
+                                                    
+                                                    ui.painter().rect_filled(
+                                                        rect, 1.0,
+                                                        egui::Color32::from_rgb(
+                                                            (color[0] * 255.0) as u8,
+                                                            (color[1] * 255.0) as u8,
+                                                            (color[2] * 255.0) as u8,
+                                                        ),
+                                                    );
+                                                    if id == selected {
+                                                        ui.painter().rect_stroke(rect, 1.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                                                    }
+                                                    if response.clicked() { selected = id; }
+                                                }
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                                });
+
+                                ui.add_space(8.0);
+                                ui.label("Material Props");
+                                ui.separator();
+                                if let Some(mat) = materials_edit.iter_mut().find(|m| m.id == selected) {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Opacity");
+                                        ui.add(egui::Slider::new(&mut mat.opacity_pct, 0.0..=100.0).show_value(true));
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Metallic");
+                                        ui.add(egui::Slider::new(&mut mat.metallic_pct, 0.0..=100.0).show_value(true));
+                                    });
+                                }
+                            });
+                    });
+
+                    // --- PILL FLOATING TOP TOOLBAR OVERLAY ---
+                    egui::Area::new(egui::Id::new("top_floating_pill"))
+                        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 42.0))
+                        .show(ctx, |ui| {
+                            egui::Frame::none()
+                                .fill(egui::Color32::from_rgba_unmultiplied(25, 26, 28, 240))
+                                .rounding(18.0)
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 70, 75, 255)))
+                                .inner_margin(egui::Margin::symmetric(14.0, 6.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(paint_mode == PaintMode::Add, "✏ Draw (Add)").clicked() { paint_mode = PaintMode::Add; }
+                                        ui.add(egui::Separator::default().shrink(4.0));
+                                        if ui.selectable_label(paint_mode == PaintMode::Replace, "🖌 Paint (Replace)").clicked() { paint_mode = PaintMode::Replace; }
+                                        ui.add(egui::Separator::default().shrink(4.0));
+                                        if ui.selectable_label(paint_mode == PaintMode::Remove, " Eraser (Remove)").clicked() { paint_mode = PaintMode::Remove; }
+                                        ui.add(egui::Separator::default().shrink(4.0));
+                                        
+                                        if ui.small_button("⮪ Undo").clicked() { op_undo = true; }
+                                        if ui.small_button("⮫ Redo").clicked() { op_redo = true; }
+                                        if ui.small_button("🗑 Clear").clicked() { op_clear = true; }
+                                    });
+                                });
                         });
-                    }
-                    ui.separator();
-                    let file_lbl = match &self.current_project_path {
-                        Some(p) => p.file_name().unwrap().to_string_lossy().into_owned(),
-                        None => "Unsaved Project".to_string(),
-                    };
-                    ui.label(format!("Active File: {file_lbl}"));
+
+                    // --- BOTTOM RUNTIME INFOBAR STATUS SHEET ---
+                    let bottom_rect = egui::Rect::from_min_size(
+                        egui::pos2(ui.max_rect().min.x, ui.max_rect().max.y - 22.0),
+                        egui::vec2(ui.max_rect().width(), 22.0)
+                    );
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bottom_rect), |ui| {
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(20, 21, 23))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 36, 40)))
+                            .show(ui, |ui| {
+                                ui.set_min_height(22.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(8.0);
+                                    ui.label(egui::RichText::new(format!("Active File: {file_label}")).size(11.0).color(egui::Color32::from_rgb(140, 142, 145)));
+                                    ui.separator();
+                                    ui.label(egui::RichText::new(format!("Voxel Count: {voxel_count}")).size(11.0).color(egui::Color32::from_rgb(140, 142, 145)));
+                                    ui.separator();
+                                    ui.label(egui::RichText::new(format!("FPS: {:.0}", fps)).size(11.0).color(egui::Color32::from_rgb(140, 142, 145)));
+                                    ui.separator();
+                                    ui.label(egui::RichText::new(format!("Mesh Build Time: {:.1}ms", mesh_build_ms)).size(11.0).color(egui::Color32::from_rgb(140, 142, 145)));
+                                });
+                            });
+                    });
                 });
         });
-        
+
         self.current_material = selected;
         self.paint_mode = paint_mode;
-        
-        // Execute Action Requests
+        self.brush_size = brush_size;
+        self.mirror_x = mirror_x;
+        self.mirror_y = mirror_y;
+        self.mirror_z = mirror_z;
+        self.materials = materials_edit;
+
         if op_new { self.file_new(); }
         if op_open { self.file_open(); }
         if op_save { self.file_save(); }
         if op_save_as { self.file_save_as(); }
         if op_exp_glb { self.file_export_glb(); }
         if op_exp_obj { self.file_export_obj(); }
+        if op_clear { self.clear_chunk(); }
+        if op_undo { self.undo(); }
+        if op_redo { self.redo(); }
 
         self.egui_state.handle_platform_output(&*self.window, full_output.platform_output);
         let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -861,9 +1077,7 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gpu.is_some() {
-            return;
-        }
+        if self.gpu.is_some() { return; }
         let window_attrs = Window::default_attributes().with_title("Voxel Engine Sandbox Studio");
         let window = Arc::new(event_loop.create_window(window_attrs).expect("create window"));
         self.gpu = Some(Gpu::new(window));
@@ -876,7 +1090,8 @@ impl ApplicationHandler for App {
         if response.repaint {
             gpu.window.request_redraw();
         }
-        let consumed_by_ui = response.consumed;
+        
+        let consumed_by_ui = response.consumed && gpu.egui_ctx.is_using_pointer();
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -886,7 +1101,9 @@ impl ApplicationHandler for App {
                     gpu.handle_mouse_button(button, state);
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => gpu.handle_cursor_moved(position.x, position.y),
+            WindowEvent::CursorMoved { position, .. } => {
+                gpu.handle_cursor_moved(position.x, position.y);
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 if !consumed_by_ui {
                     gpu.handle_scroll(delta);
@@ -894,22 +1111,22 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ModifiersChanged(modifiers) => gpu.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if !consumed_by_ui && event.state == ElementState::Pressed {
+                let consumed_by_kbd = response.consumed && gpu.egui_ctx.wants_keyboard_input();
+                if !consumed_by_kbd && event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         match code {
                             KeyCode::Digit1 => gpu.set_material(1),
                             KeyCode::Digit2 => gpu.set_material(2),
                             KeyCode::Digit3 => gpu.set_material(3),
-                            
-                            // Updated KeyS logic to handle both Ctrl+S and Ctrl+Shift+S
                             KeyCode::KeyS if gpu.modifiers.control_key() => {
                                 if gpu.modifiers.shift_key() {
-                                    gpu.file_save_as(); // Opens native dialog for .bin, .obj, or .glb
+                                    gpu.file_save_as();
                                 } else {
-                                    gpu.file_save();    // Quick saves to existing path or fallback
+                                    gpu.file_save();
                                 }
                             }
-                            
+                            KeyCode::KeyN if gpu.modifiers.control_key() => gpu.file_new(),
+                            KeyCode::KeyO if gpu.modifiers.control_key() => gpu.file_open(),
                             KeyCode::KeyE if gpu.modifiers.control_key() => gpu.file_export_glb(),
                             KeyCode::KeyZ if gpu.modifiers.control_key() && gpu.modifiers.shift_key() => gpu.redo(),
                             KeyCode::KeyZ if gpu.modifiers.control_key() => gpu.undo(),
