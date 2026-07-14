@@ -517,7 +517,7 @@ impl Gpu {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None, // Set to None so grid and block undersides don't cull out prematurely
+                cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -553,11 +553,17 @@ impl Gpu {
         let egui_ctx = egui::Context::default();
         
         let mut visuals = egui::Visuals::dark();
-        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(26, 27, 30);
-        visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(26, 27, 30);
-        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 45, 48));
-        visuals.window_fill = egui::Color32::from_rgb(22, 23, 25);
-        visuals.panel_fill = egui::Color32::from_rgb(22, 23, 25);
+        // Background palette matching modern DCC viewports (Blender/MagicaVoxel layout structures)
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(20, 21, 23);
+        visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(24, 25, 28);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 42, 45));
+        
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(32, 34, 38);
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(45, 48, 54);
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0, 120, 255); // Highlight structural interactions blue
+
+        visuals.window_fill = egui::Color32::from_rgb(18, 19, 21);
+        visuals.panel_fill = egui::Color32::from_rgb(18, 19, 21);
         egui_ctx.set_visuals(visuals);
 
         let egui_state = EguiState::new(
@@ -631,7 +637,6 @@ impl Gpu {
 
     fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
         match button {
-            // Middle Mouse Button (Scroll wheel click) handles looking around / camera orbit operations
             MouseButton::Middle => {
                 if state == ElementState::Pressed {
                     self.dragging = true;
@@ -641,7 +646,6 @@ impl Gpu {
                     self.drag_last = None;
                 }
             }
-            // Left click triggers structural canvas alterations exclusively
             MouseButton::Left => {
                 if state == ElementState::Pressed {
                     self.press_pos = Some(self.cursor_pos);
@@ -922,9 +926,13 @@ impl Gpu {
                 });
             });
 
-            // Styling layout options
-            let mut panel_frame = egui::Frame::side_top_panel(&&ctx.style());
-            panel_frame.inner_margin = egui::Margin::same(12.0);
+            // Modernizing panel framing properties
+            let panel_frame = egui::Frame {
+                fill: ctx.style().visuals.panel_fill,
+                inner_margin: egui::Margin::same(14.0),
+                stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 37, 40)),
+                ..Default::default()
+            };
             
             // --- Left Toolbar (Tools) ---
             egui::SidePanel::left("left_panel")
@@ -959,13 +967,46 @@ impl Gpu {
                 .exact_width(260.0)
                 .resizable(false)
                 .show(&ctx, |ui| {
+                    // 1. ACTIVE MATERIAL PREVIEW
+                    ui.label(egui::RichText::new("ACTIVE MATERIAL").strong().color(egui::Color32::WHITE));
+                    ui.add_space(4.0);
+                    
+                    if let Some(active_mat) = self.materials.iter().find(|m| m.id == selected) {
+                        ui.horizontal(|ui| {
+                            // Big color swatch preview
+                            let (r, g, b) = ((active_mat.color[0] * 255.0) as u8, (active_mat.color[1] * 255.0) as u8, (active_mat.color[2] * 255.0) as u8);
+                            let preview_color = egui::Color32::from_rgb(r, g, b);
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 6.0, preview_color);
+                            ui.painter().rect_stroke(rect, 6.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(40)));
+
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(active_mat.name).strong().color(egui::Color32::WHITE));
+                                ui.label(egui::RichText::new(format!("ID: #{:03}", active_mat.id)).weak());
+                            });
+                        });
+                    }
+                    
+                    ui.add_space(16.0);
+
+                    // 2. PALETTE TABS
                     ui.label(egui::RichText::new("PALETTE").strong().color(egui::Color32::WHITE));
                     ui.separator();
                     
-                    // Render 255 swatches natively simulating typical grid view editor
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let _ = ui.selectable_label(true, "Project");
+                        let _ = ui.selectable_label(false, "Custom");
+                        let _ = ui.selectable_label(false, "History");
+                    });
+                    ui.add_space(6.0);
+                    
+                    // 3. SWATCH GRID (Scrollable)
+                    let available_height = ui.available_height() - 140.0; // Reserve space for properties below
+                    egui::ScrollArea::vertical().max_height(available_height).show(ui, |ui| {
+                        let swatch_size = egui::vec2(21.0, 21.0);
+                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                        
                         ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
                             for mat in &materials_edit {
                                 let color = egui::Color32::from_rgb(
                                     (mat.color[0] * 255.0) as u8,
@@ -974,22 +1015,57 @@ impl Gpu {
                                 );
                                 
                                 let is_selected = selected == mat.id;
-                                let response = ui.allocate_response(egui::vec2(18.0, 18.0), egui::Sense::click());
+                                let response = ui.allocate_response(swatch_size, egui::Sense::click());
                                 if response.clicked() {
                                     selected = mat.id;
                                 }
                                 
-                                let rect = response.rect;
-                                ui.painter().rect_filled(rect, 2.0, color);
+                                let mut rect = response.rect;
                                 
+                                // Hover Animation: Expand slightly
+                                if response.hovered() {
+                                    rect = rect.expand(1.5);
+                                }
+                                
+                                // Render Swatch Base
+                                ui.painter().rect_filled(rect, 4.0, color);
+                                
+                                // Selection Accent / Border Styling
                                 if is_selected {
-                                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                                    // Modern crisp neon blue selection border
+                                    let blue_accent = egui::Color32::from_rgb(0, 140, 255);
+                                    ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.0, blue_accent));
+                                    ui.painter().rect_stroke(rect.expand(1.5), 5.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
+                                } else if response.hovered() {
+                                    ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
                                 } else {
-                                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_black_alpha(100)));
+                                    ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.0, egui::Color32::from_black_alpha(80)));
                                 }
                             }
                         });
                     });
+
+                    ui.add_space(16.0);
+
+                    // 4. MATERIAL PROPERTIES SLIDERS
+                    ui.label(egui::RichText::new("MATERIAL PROPERTIES").strong().color(egui::Color32::WHITE));
+                    ui.separator();
+                    
+                    if let Some(idx) = self.materials.iter().position(|m| m.id == selected) {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Opacity").weak());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add(egui::Slider::new(&mut self.materials[idx].opacity_pct, 0.0..=100.0).text("%").show_value(true));
+                            });
+                        });
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Metallic").weak());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add(egui::Slider::new(&mut self.materials[idx].metallic_pct, 0.0..=100.0).text("%").show_value(true));
+                            });
+                        });
+                    }
             });
 
             // --- Bottom Infobar ---
@@ -1048,7 +1124,6 @@ impl Gpu {
                     occlusion_query_set: None,
                 });
 
-                // Required by recent egui_wgpu versions
                 let mut rpass = rpass.forget_lifetime();
 
                 self.egui_renderer
