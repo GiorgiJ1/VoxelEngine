@@ -8,7 +8,8 @@ The project demonstrates how to build a complete voxel pipeline without relying 
 
 # Preview
 
-> <img width="1918" height="1017" alt="image" src="https://github.com/user-attachments/assets/0f1c93bb-a7b8-4223-911c-970d6f8f9b89" />
+> <img width="1917" height="1017" alt="image" src="https://github.com/user-attachments/assets/1520b4da-f985-4bf9-8c87-c2e7c724ccf3" />
+
 
 
 ![Editor](docs/editor.png)
