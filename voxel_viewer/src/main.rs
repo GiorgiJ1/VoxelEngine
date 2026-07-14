@@ -107,17 +107,63 @@ struct Material {
     metallic_pct: f32,
 }
 
+// Helper function to generate full 255 color palette
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (h * 6.0) as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (r + m, g + m, b + m)
+}
+
 fn default_materials() -> Vec<Material> {
-    vec![
-        Material { id: 1, name: "White", color: [0.93, 0.93, 0.94], opacity_pct: 100.0, metallic_pct: 0.0 },
-        Material { id: 2, name: "Coral", color: [0.92, 0.38, 0.38], opacity_pct: 100.0, metallic_pct: 0.0 },
-        Material { id: 3, name: "Sun", color: [0.95, 0.80, 0.25], opacity_pct: 100.0, metallic_pct: 0.0 },
-        Material { id: 4, name: "Leaf", color: [0.35, 0.75, 0.40], opacity_pct: 100.0, metallic_pct: 0.0 },
-        Material { id: 5, name: "Sky", color: [0.30, 0.55, 0.90], opacity_pct: 100.0, metallic_pct: 0.0 },
-        Material { id: 6, name: "Grape", color: [0.58, 0.38, 0.85], opacity_pct: 100.0, metallic_pct: 0.0 },
-        Material { id: 7, name: "Charcoal", color: [0.28, 0.28, 0.31], opacity_pct: 100.0, metallic_pct: 0.0 },
-        Material { id: 8, name: "Rust", color: [0.75, 0.42, 0.22], opacity_pct: 100.0, metallic_pct: 0.0 },
-    ]
+    let mut mats = Vec::new();
+    
+    // Core explicitly targeted colors for the pedastal
+    mats.push(Material { id: 1, name: "Red", color: [0.8, 0.25, 0.25], opacity_pct: 100.0, metallic_pct: 0.0 });
+    mats.push(Material { id: 2, name: "Green", color: [0.35, 0.65, 0.25], opacity_pct: 100.0, metallic_pct: 0.0 });
+    mats.push(Material { id: 3, name: "Blue", color: [0.25, 0.45, 0.85], opacity_pct: 100.0, metallic_pct: 0.0 });
+    mats.push(Material { id: 4, name: "White", color: [0.95, 0.95, 0.95], opacity_pct: 100.0, metallic_pct: 0.0 });
+
+    // Procedurally generated grid of standard MagicVoxel-style colors
+    let mut id = 5;
+    
+    // Grayscale
+    for i in 0..12 {
+        let v = i as f32 / 11.0;
+        mats.push(Material { id: id as u16, name: "Gray", color: [v, v, v], opacity_pct: 100.0, metallic_pct: 0.0 });
+        id += 1;
+    }
+
+    // Color swatches
+    for h in 0..12 {
+        for s in 0..4 {
+            for l in 0..5 {
+                if id > 255 { break; }
+                let hue = h as f32 / 12.0;
+                let sat = 1.0 - (s as f32 / 4.0);
+                let light = 0.2 + (l as f32 / 5.0) * 0.7;
+                let (r, g, b) = hsl_to_rgb(hue, sat, light);
+                mats.push(Material { id: id as u16, name: "Color", color: [r, g, b], opacity_pct: 100.0, metallic_pct: 0.0 });
+                id += 1;
+            }
+        }
+    }
+    
+    // Fill remaining to ensure exactly 255 materials available in palette
+    while id <= 255 {
+        mats.push(Material { id: id as u16, name: "Color", color: [0.5, 0.5, 0.5], opacity_pct: 100.0, metallic_pct: 0.0 });
+        id += 1;
+    }
+    
+    mats
 }
 
 fn material_color(materials: &[Material], id: u16) -> [f32; 3] {
@@ -130,22 +176,41 @@ fn material_color(materials: &[Material], id: u16) -> [f32; 3] {
 
 fn build_demo_chunk() -> Chunk {
     let mut chunk = Chunk::empty();
-    for x in 0..4 {
-        for z in 0..4 {
-            chunk.set(x, 0, z, Voxel::new(4));
+    
+    let center_x = CHUNK_SIZE / 2;
+    let center_z = CHUNK_SIZE / 2;
+    
+    // Base platform (Green)
+    let base_radius = 6;
+    for x in (center_x - base_radius)..=(center_x + base_radius) {
+        for z in (center_z - base_radius)..=(center_z + base_radius) {
+            chunk.set(x, 0, z, Voxel::new(2)); 
         }
     }
-    for y in 1..4 {
-        chunk.set(1, y, 1, Voxel::new(8));
-        chunk.set(2, y, 1, Voxel::new(8));
-        chunk.set(1, y, 2, Voxel::new(8));
-        chunk.set(2, y, 2, Voxel::new(8));
-    }
-    for x in 0..3 {
-        for z in 0..3 {
-            chunk.set(x, 4, z, Voxel::new(2));
+    
+    // Pedestal Bottom Layer (Red)
+    for x in (center_x - 2)..=(center_x + 2) {
+        for z in (center_z - 2)..=(center_z + 2) {
+            chunk.set(x, 1, z, Voxel::new(1));
         }
     }
+    
+    // Pillar Column (Red)
+    for y in 2..7 {
+        for x in (center_x - 1)..=(center_x + 1) {
+            for z in (center_z - 1)..=(center_z + 1) {
+                chunk.set(x, y, z, Voxel::new(1));
+            }
+        }
+    }
+    
+    // Pedestal Top Layer (Red)
+    for x in (center_x - 2)..=(center_x + 2) {
+        for z in (center_z - 2)..=(center_z + 2) {
+            chunk.set(x, 7, z, Voxel::new(1));
+        }
+    }
+    
     chunk
 }
 
@@ -521,7 +586,7 @@ impl Gpu {
             camera: Camera::default(),
             chunk,
             materials,
-            current_material: 5,
+            current_material: 1,
             paint_mode: PaintMode::Add,
             dragging: false,
             cursor_pos: (0.0, 0.0),
@@ -566,7 +631,7 @@ impl Gpu {
 
     fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
         match button {
-            // FIX: Middle Mouse Button (Scroll wheel click) handles looking around / camera orbit operations
+            // Middle Mouse Button (Scroll wheel click) handles looking around / camera orbit operations
             MouseButton::Middle => {
                 if state == ElementState::Pressed {
                     self.dragging = true;
@@ -621,7 +686,7 @@ impl Gpu {
     }
 
     fn set_material(&mut self, id: u16) {
-        if id > 0 && id <= 8 {
+        if id > 0 && id <= 255 {
             self.current_material = id;
         }
     }
@@ -756,235 +821,255 @@ impl Gpu {
             let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
             {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("main_pass"),
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.11, g: 0.12, b: 0.14, a: 1.0 }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.1,
+                                g: 0.1,
+                                b: 0.1,
+                                a: 1.0,
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &self.depth_view,
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
                         stencil_ops: None,
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
 
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.num_indices, 0, 0..1);
+                if self.num_indices > 0 {
+                    rpass.set_pipeline(&self.pipeline);
+                    rpass.set_bind_group(0, &self.bind_group, &[]);
+                    rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                    rpass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.draw_indexed(0..self.num_indices, 0, 0..1);
+                }
             }
 
-            let raw_input = self.egui_state.take_egui_input(&*self.window);
-            
-            // Internal state clones for UI interaction
-            let mut selected = self.current_material;
+            let egui_input = self.egui_state.take_egui_input(&self.window);
+            self.egui_ctx.begin_pass(egui_input);
+
+            let ctx = self.egui_ctx.clone();
+
             let mut paint_mode = self.paint_mode;
+            let mut selected = self.current_material;
+            let materials_edit = self.materials.clone();
             let mut brush_size = self.brush_size;
             let mut mirror_x = self.mirror_x;
             let mut mirror_y = self.mirror_y;
             let mut mirror_z = self.mirror_z;
-            let voxel_count = self.voxel_count();
-            let fps = self.fps;
-            let mesh_build_ms = self.last_mesh_build_ms;
-            let mut materials_edit = self.materials.clone();
-            let file_label = self.current_project_path.as_ref().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).unwrap_or("unsaved_project.bin".into());
 
-            let mut op_new = false; let mut op_open = false; let mut op_save = false;
-            let mut op_save_as = false; let mut op_exp_glb = false; let mut op_exp_obj = false;
-            let mut op_undo = false; let mut op_redo = false;
-
-            let full_output = self.egui_ctx.run(raw_input, |ctx| {
-                let dark_bg = egui::Color32::from_rgb(15, 17, 21);
-                let panel_frame = egui::Frame::none().fill(dark_bg).inner_margin(12.0);
-
-                // Top Menu Bar
-                egui::TopBottomPanel::top("top_bar").frame(egui::Frame::none().fill(egui::Color32::from_rgb(20, 22, 26)).inner_margin(egui::Margin::symmetric(16.0, 6.0))).exact_height(35.0).show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("⬡ Voxel Engine Sandbox Studio").color(egui::Color32::from_gray(200)));
-                        ui.menu_button("File", |ui| {
-                            if ui.button("New").clicked() { op_new = true; }
-                            if ui.button("Open...").clicked() { op_open = true; }
-                            ui.separator();
-                            if ui.button("Save").clicked() { op_save = true; }
-                        });
-                        ui.button("Edit"); ui.button("Selection"); ui.button("View");
+            // --- Top Menu Bar ---
+            egui::TopBottomPanel::top("top_panel").show(&&ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.button("New").clicked() {
+                            self.file_new();
+                            ui.close_menu();
+                        }
+                        if ui.button("Open...").clicked() {
+                            self.file_open();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Save").clicked() {
+                            self.file_save();
+                            ui.close_menu();
+                        }
+                        if ui.button("Save As...").clicked() {
+                            self.file_save_as();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Export GLB...").clicked() {
+                            self.file_export_glb();
+                            ui.close_menu();
+                        }
+                        if ui.button("Export OBJ...").clicked() {
+                            self.file_export_obj();
+                            ui.close_menu();
+                        }
                     });
-                });
 
-                // Left Sidebar
-                egui::SidePanel::left("left_panel").frame(panel_frame).exact_width(200.0).show(ctx, |ui| {
-                    ui.label("FILES");
-                    ui.separator();
-                    ui.label(format!("📄 New\tCtrl+N"));
-                    ui.add_space(20.0);
-                    ui.label("TOOLS");
-                    ui.separator();
-                    if ui.selectable_label(paint_mode == PaintMode::Add, "Draw").clicked() { paint_mode = PaintMode::Add; }
-                    if ui.selectable_label(paint_mode == PaintMode::Replace, "Paint").clicked() { paint_mode = PaintMode::Replace; }
-                    if ui.selectable_label(paint_mode == PaintMode::Remove, "Erase").clicked() { paint_mode = PaintMode::Remove; }
-                });
-
-                // Right Sidebar
-                egui::SidePanel::right("right_panel").frame(panel_frame).exact_width(250.0).show(ctx, |ui| {
-                    ui.label("MATERIALS");
-                    ui.separator();
-                    let active = materials_edit.iter().find(|m| m.id == selected).unwrap();
-                    ui.label(format!("#{:02} {}", active.id, active.name));
-                    ui.add(egui::Slider::new(&mut brush_size, 1..=10).text("Brush Size"));
-                });
-
-                // Bottom Status
-                egui::TopBottomPanel::bottom("status").frame(egui::Frame::none().fill(egui::Color32::from_rgb(18, 20, 24)).inner_margin(8.0)).show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("⮪").clicked() { op_undo = true; }
-                        if ui.button("⮫").clicked() { op_redo = true; }
-                        ui.label(format!("Voxel Count: {} | FPS: {:.0}", voxel_count, fps));
-                    });
-                });
-
-                // Central Floating Pill
-                egui::Area::new(egui::Id::new("pill")).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 50.0)).show(ctx, |ui| {
-                    egui::Frame::none().fill(egui::Color32::from_rgba_unmultiplied(25, 26, 28, 240)).rounding(20.0).inner_margin(10.0).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.button("✏").clicked() { paint_mode = PaintMode::Add; }
-                            if ui.button("🖌").clicked() { paint_mode = PaintMode::Replace; }
-                            if ui.button("⌫").clicked() { paint_mode = PaintMode::Remove; }
-                        });
+                    ui.menu_button("Edit", |ui| {
+                        if ui.button("Undo").clicked() {
+                            self.undo();
+                            ui.close_menu();
+                        }
+                        if ui.button("Redo").clicked() {
+                            self.redo();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Clear Voxel Canvas").clicked() {
+                            self.clear_chunk();
+                            ui.close_menu();
+                        }
                     });
                 });
             });
 
-            // Sync back state
-            self.current_material = selected; self.paint_mode = paint_mode;
-            self.brush_size = brush_size; self.mirror_x = mirror_x;
-            self.mirror_y = mirror_y; self.mirror_z = mirror_z; self.materials = materials_edit;
+            // Styling layout options
+            let mut panel_frame = egui::Frame::side_top_panel(&&ctx.style());
+            panel_frame.inner_margin = egui::Margin::same(12.0);
+            
+            // --- Left Toolbar (Tools) ---
+            egui::SidePanel::left("left_panel")
+                .frame(panel_frame)
+                .exact_width(180.0)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label(egui::RichText::new("BRUSH").strong().color(egui::Color32::WHITE));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(paint_mode == PaintMode::Add, "Attach").clicked() { paint_mode = PaintMode::Add; }
+                        if ui.selectable_label(paint_mode == PaintMode::Replace, "Paint").clicked() { paint_mode = PaintMode::Replace; }
+                        if ui.selectable_label(paint_mode == PaintMode::Remove, "Erase").clicked() { paint_mode = PaintMode::Remove; }
+                    });
+                    
+                    ui.add_space(10.0);
+                    ui.add(egui::Slider::new(&mut brush_size, 1..=10).text("Size"));
+                    ui.add_space(20.0);
 
-            // Apply operations
-            if op_new { self.file_new(); } if op_undo { self.undo(); } if op_redo { self.redo(); }
+                    ui.label(egui::RichText::new("MIRROR").strong().color(egui::Color32::WHITE));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.toggle_value(&mut mirror_x, "X");
+                        ui.toggle_value(&mut mirror_y, "Y");
+                        ui.toggle_value(&mut mirror_z, "Z");
+                    });
+            });
 
-            // Render UI
-            self.egui_state.handle_platform_output(&*self.window, full_output.platform_output);
-            let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-            for (id, image_delta) in &full_output.textures_delta.set { self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta); }
-            let screen_descriptor = ScreenDescriptor { size_in_pixels: [self.config.width, self.config.height], pixels_per_point: self.window.scale_factor() as f32 };
-            self.egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, &clipped_primitives, &screen_descriptor);
-
-            {
-                let mut egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("egui_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
-                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
-                }).forget_lifetime();
-                self.egui_renderer.render(&mut egui_pass, &clipped_primitives, &screen_descriptor);
-            }
-
-            self.queue.submit(std::iter::once(encoder.finish()));
-            frame.present();
-            Ok(())
-        }
-}
-
-#[derive(Default)]
-struct App {
-    gpu: Option<Gpu>,
-}
-
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gpu.is_some() { return; }
-        let window_attrs = Window::default_attributes().with_title("Voxel Engine Sandbox Studio");
-        let window = Arc::new(event_loop.create_window(window_attrs).expect("create window"));
-        self.gpu = Some(Gpu::new(window));
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(gpu) = &mut self.gpu else { return };
-
-        let response = gpu.egui_state.on_window_event(&*gpu.window, &event);
-        if response.repaint {
-            gpu.window.request_redraw();
-        }
-        
-        let consumed_by_ui = response.consumed && gpu.egui_ctx.is_using_pointer();
-
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
-            WindowEvent::MouseInput { button, state, .. } => {
-                if !consumed_by_ui {
-                    gpu.handle_mouse_button(button, state);
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                gpu.handle_cursor_moved(position.x, position.y);
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if !consumed_by_ui {
-                    gpu.handle_scroll(delta);
-                }
-            }
-            WindowEvent::ModifiersChanged(modifiers) => gpu.modifiers = modifiers.state(),
-            WindowEvent::KeyboardInput { event, .. } => {
-                let consumed_by_kbd = response.consumed && gpu.egui_ctx.wants_keyboard_input();
-                if !consumed_by_kbd && event.state == ElementState::Pressed {
-                    if let PhysicalKey::Code(code) = event.physical_key {
-                        match code {
-                            KeyCode::Digit1 => gpu.set_material(1),
-                            KeyCode::Digit2 => gpu.set_material(2),
-                            KeyCode::Digit3 => gpu.set_material(3),
-                            KeyCode::KeyS if gpu.modifiers.control_key() => {
-                                if gpu.modifiers.shift_key() {
-                                    gpu.file_save_as();
+            // --- Right Toolbar (Palette & Materials) ---
+            egui::SidePanel::right("right_panel")
+                .frame(panel_frame)
+                .exact_width(260.0)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label(egui::RichText::new("PALETTE").strong().color(egui::Color32::WHITE));
+                    ui.separator();
+                    
+                    // Render 255 swatches natively simulating typical grid view editor
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                            for mat in &materials_edit {
+                                let color = egui::Color32::from_rgb(
+                                    (mat.color[0] * 255.0) as u8,
+                                    (mat.color[1] * 255.0) as u8,
+                                    (mat.color[2] * 255.0) as u8,
+                                );
+                                
+                                let is_selected = selected == mat.id;
+                                let response = ui.allocate_response(egui::vec2(18.0, 18.0), egui::Sense::click());
+                                if response.clicked() {
+                                    selected = mat.id;
+                                }
+                                
+                                let rect = response.rect;
+                                ui.painter().rect_filled(rect, 2.0, color);
+                                
+                                if is_selected {
+                                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
                                 } else {
-                                    gpu.file_save();
+                                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_black_alpha(100)));
                                 }
                             }
-                            KeyCode::KeyN if gpu.modifiers.control_key() => gpu.file_new(),
-                            KeyCode::KeyO if gpu.modifiers.control_key() => gpu.file_open(),
-                            KeyCode::KeyE if gpu.modifiers.control_key() => gpu.file_export_glb(),
-                            KeyCode::KeyZ if gpu.modifiers.control_key() && gpu.modifiers.shift_key() => gpu.redo(),
-                            KeyCode::KeyZ if gpu.modifiers.control_key() => gpu.undo(),
-                            KeyCode::KeyY if gpu.modifiers.control_key() => gpu.redo(),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                match gpu.render() {
-                    Ok(()) => {}
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        gpu.resize(gpu.config.width, gpu.config.height)
-                    }
-                    Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
-                    Err(e) => eprintln!("render error: {e:?}"),
-                }
-                gpu.window.request_redraw();
-            }
-            _ => {}
-        }
-    }
-}
+                        });
+                    });
+            });
 
-fn main() {
-    let event_loop = EventLoop::new().expect("create event loop");
-    let mut app = App::default();
-    event_loop.run_app(&mut app).expect("run app");
+            // --- Bottom Infobar ---
+            let bottom_frame = egui::Frame::side_top_panel(&&ctx.style()).inner_margin(egui::Margin::symmetric(16.0, 6.0));
+            egui::TopBottomPanel::bottom("bottom_panel").frame(bottom_frame).show(&ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Dimensions: {}x{}x{}", CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE));
+                    ui.separator();
+                    ui.label(format!("Voxels: {}", self.voxel_count()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(format!("{:.1} FPS", self.fps));
+                        ui.separator();
+                        ui.label(format!("Build ms: {:.2}", self.last_mesh_build_ms));
+                        ui.separator();
+                        ui.label(if self.undo_stack.is_empty() { "Saved" } else { "Unsaved changes" });
+                    });
+                });
+            });
+
+            self.paint_mode = paint_mode;
+            if selected != self.current_material {
+                self.set_material(selected);
+            }
+            self.brush_size = brush_size;
+            self.mirror_x = mirror_x;
+            self.mirror_y = mirror_y;
+            self.mirror_z = mirror_z;
+
+            let output = self.egui_ctx.end_pass();
+            let paint_jobs = self.egui_ctx.tessellate(output.shapes, self.egui_ctx.pixels_per_point());
+
+            let screen_descriptor = ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point: self.window.scale_factor() as f32,
+            };
+
+            for (id, image_delta) in &output.textures_delta.set {
+                self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
+            }
+
+            self.egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, &paint_jobs, &screen_descriptor);
+
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui render pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+
+                // Required by recent egui_wgpu versions
+                let mut rpass = rpass.forget_lifetime();
+
+                self.egui_renderer
+                    .render(&mut rpass, &paint_jobs, &screen_descriptor);
+            }
+
+            self.queue.submit(Some(encoder.finish()));
+            frame.present();
+
+            for id in &output.textures_delta.free {
+                self.egui_renderer.free_texture(id);
+            }
+
+            Ok(())
+    }
 }
 
 fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
     let size = wgpu::Extent3d {
-        width: config.width.max(1),
-        height: config.height.max(1),
+        width: config.width,
+        height: config.height,
         depth_or_array_layers: 1,
     };
     let desc = wgpu::TextureDescriptor {
@@ -999,4 +1084,89 @@ fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration)
     };
     let texture = device.create_texture(&desc);
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+struct App {
+    gpu: Option<Gpu>,
+}
+
+impl App {
+    fn new() -> Self {
+        Self { gpu: None }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gpu.is_none() {
+            let attrs = Window::default_attributes().with_title("Voxel Editor");
+            let window = Arc::new(event_loop.create_window(attrs).unwrap());
+            self.gpu = Some(Gpu::new(window));
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let gpu = match self.gpu.as_mut() {
+            Some(g) if g.window.id() == id => g,
+            _ => return,
+        };
+
+        let response = gpu.egui_state.on_window_event(&gpu.window, &event);
+        if response.consumed {
+            return;
+        }
+
+        match event {
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+            }
+            WindowEvent::Resized(physical_size) => {
+                gpu.resize(physical_size.width, physical_size.height);
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                gpu.modifiers = modifiers.state();
+            }
+            WindowEvent::KeyboardInput { event: kb_event, .. } => {
+                if kb_event.state == ElementState::Pressed {
+                    match kb_event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyS) if gpu.modifiers.control_key() => gpu.file_save(),
+                        PhysicalKey::Code(KeyCode::KeyZ) if gpu.modifiers.control_key() => gpu.undo(),
+                        PhysicalKey::Code(KeyCode::KeyY) if gpu.modifiers.control_key() => gpu.redo(),
+                        PhysicalKey::Code(KeyCode::KeyE) if gpu.modifiers.control_key() => gpu.file_export_glb(),
+                        PhysicalKey::Code(KeyCode::Digit1) => gpu.set_material(1),
+                        PhysicalKey::Code(KeyCode::Digit2) => gpu.set_material(2),
+                        PhysicalKey::Code(KeyCode::Digit3) => gpu.set_material(3),
+                        PhysicalKey::Code(KeyCode::Digit4) => gpu.set_material(4),
+                        PhysicalKey::Code(KeyCode::Digit5) => gpu.set_material(5),
+                        PhysicalKey::Code(KeyCode::Digit6) => gpu.set_material(6),
+                        PhysicalKey::Code(KeyCode::Digit7) => gpu.set_material(7),
+                        PhysicalKey::Code(KeyCode::Digit8) => gpu.set_material(8),
+                        _ => {}
+                    }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                gpu.handle_cursor_moved(position.x, position.y);
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                gpu.handle_mouse_button(button, state);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                gpu.handle_scroll(delta);
+            }
+            WindowEvent::RedrawRequested => {
+                if let Err(e) = gpu.render() {
+                    eprintln!("Render error: {e}");
+                }
+                gpu.window.request_redraw();
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn main() {
+    let event_loop = EventLoop::new().unwrap();
+    let mut app = App::new();
+    let _ = event_loop.run_app(&mut app);
 }
