@@ -6,6 +6,7 @@ pub mod persistence;
 pub mod raycast;
 pub mod voxel;
 pub mod world;
+pub mod brush;
 
 pub use chunk::{Chunk, CHUNK_SIZE};
 pub use export::{export_gltf_glb, export_obj_mtl, import_gltf_glb, ImportedMesh};
@@ -15,3 +16,4 @@ pub use persistence::{load_chunk, save_chunk, LoadError};
 pub use raycast::{raycast_chunk, RayHit};
 pub use voxel::Voxel;
 pub use world::VoxelWorld;
+pub use brush::line_voxels;
