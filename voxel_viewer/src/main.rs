@@ -126,13 +126,13 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
 fn default_materials() -> Vec<Material> {
     let mut mats = Vec::new();
     
-    // Core explicitly targeted colors for the pedastal
+    // Core explicitly targeted colors for the pedestal
     mats.push(Material { id: 1, name: "Red", color: [0.8, 0.25, 0.25], opacity_pct: 100.0, metallic_pct: 0.0 });
     mats.push(Material { id: 2, name: "Green", color: [0.35, 0.65, 0.25], opacity_pct: 100.0, metallic_pct: 0.0 });
     mats.push(Material { id: 3, name: "Blue", color: [0.25, 0.45, 0.85], opacity_pct: 100.0, metallic_pct: 0.0 });
     mats.push(Material { id: 4, name: "White", color: [0.95, 0.95, 0.95], opacity_pct: 100.0, metallic_pct: 0.0 });
 
-    // Procedurally generated grid of standard MagicVoxel-style colors
+    // Procedurally generated grid of standard MagicaVoxel-style colors
     let mut id = 5;
     
     // Grayscale
@@ -243,6 +243,79 @@ fn mesh_to_vertices(mesh: &MeshData, materials: &[Material]) -> (Vec<Vertex>, Ve
     (vertices, indices)
 }
 
+// Generates all 3D integer coordinates along a line from start to end using a 3D Bresenham/Voxel line algorithm.
+fn get_3d_line_coords(start: IVec3, end: IVec3) -> Vec<IVec3> {
+    let mut coords = Vec::new();
+    let dx = (end.x - start.x).abs();
+    let dy = (end.y - start.y).abs();
+    let dz = (end.z - start.z).abs();
+
+    let sx = if start.x < end.x { 1 } else { -1 };
+    let sy = if start.y < end.y { 1 } else { -1 };
+    let sz = if start.z < end.z { 1 } else { -1 };
+
+    let mut x = start.x;
+    let mut y = start.y;
+    let mut z = start.z;
+
+    if dx >= dy && dx >= dz {
+        let mut err_1 = 2 * dy - dx;
+        let mut err_2 = 2 * dz - dx;
+        loop {
+            coords.push(IVec3::new(x, y, z));
+            if x == end.x { break; }
+            x += sx;
+            if err_1 > 0 {
+                y += sy;
+                err_1 -= 2 * dx;
+            }
+            if err_2 > 0 {
+                z += sz;
+                err_2 -= 2 * dx;
+            }
+            err_1 += 2 * dy;
+            err_2 += 2 * dz;
+        }
+    } else if dy >= dx && dy >= dz {
+        let mut err_1 = 2 * dx - dy;
+        let mut err_2 = 2 * dz - dy;
+        loop {
+            coords.push(IVec3::new(x, y, z));
+            if y == end.y { break; }
+            y += sy;
+            if err_1 > 0 {
+                x += sx;
+                err_1 -= 2 * dy;
+            }
+            if err_2 > 0 {
+                z += sz;
+                err_2 -= 2 * dy;
+            }
+            err_1 += 2 * dx;
+            err_2 += 2 * dz;
+        }
+    } else {
+        let mut err_1 = 2 * dy - dz;
+        let mut err_2 = 2 * dx - dz;
+        loop {
+            coords.push(IVec3::new(x, y, z));
+            if z == end.z { break; }
+            z += sz;
+            if err_1 > 0 {
+                y += sy;
+                err_1 -= 2 * dz;
+            }
+            if err_2 > 0 {
+                x += sx;
+                err_2 -= 2 * dz;
+            }
+            err_1 += 2 * dy;
+            err_2 += 2 * dx;
+        }
+    }
+    coords
+}
+
 struct Gpu {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -276,6 +349,8 @@ struct Gpu {
     mirror_x: bool,
     mirror_y: bool,
     mirror_z: bool,
+    is_painting: bool,
+    last_painted_coords: Option<IVec3>,
     last_frame_instant: Instant,
     fps: f32,
     last_mesh_build_ms: f32,
@@ -609,6 +684,8 @@ impl Gpu {
             mirror_x: false,
             mirror_y: false,
             mirror_z: false,
+            is_painting: false,
+            last_painted_coords: None,
             last_frame_instant: Instant::now(),
             fps: 0.0,
             last_mesh_build_ms: initial_mesh_build_ms,
@@ -633,8 +710,6 @@ impl Gpu {
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    const CLICK_MOVE_THRESHOLD: f64 = 4.0;
-
     fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
         match button {
             MouseButton::Middle => {
@@ -648,21 +723,23 @@ impl Gpu {
             }
             MouseButton::Left => {
                 if state == ElementState::Pressed {
-                    self.press_pos = Some(self.cursor_pos);
-                } else if state == ElementState::Released {
-                    if let Some(press) = self.press_pos.take() {
-                        let moved = ((self.cursor_pos.0 - press.0).powi(2)
-                            + (self.cursor_pos.1 - press.1).powi(2))
-                        .sqrt();
-                        if moved < Self::CLICK_MOVE_THRESHOLD {
-                            self.apply_paint(self.cursor_pos.0, self.cursor_pos.1);
-                        }
-                    }
+                    self.is_painting = true;
+                    self.last_painted_coords = None; // Reset stroke
+                    self.update_drag_painting();
+                } else {
+                    self.is_painting = false;
+                    self.last_painted_coords = None;
                 }
             }
             MouseButton::Right => {
-                if state == ElementState::Released {
-                    self.try_remove_voxel(self.cursor_pos.0, self.cursor_pos.1);
+                if state == ElementState::Pressed {
+                    // Right-click works as a quick erase shortcut!
+                    self.push_undo_snapshot();
+                    let (origin, dir) = self.cursor_ray(self.cursor_pos.0, self.cursor_pos.1);
+                    if let Some(hit) = raycast_chunk(&self.chunk, origin, dir) {
+                        self.chunk.set(hit.voxel.x as usize, hit.voxel.y as usize, hit.voxel.z as usize, Voxel::EMPTY);
+                        self.rebuild_mesh();
+                    }
                 }
             }
             _ => {}
@@ -671,6 +748,8 @@ impl Gpu {
 
     fn handle_cursor_moved(&mut self, x: f64, y: f64) {
         self.cursor_pos = (x, y);
+        
+        // Handle Camera Orbit (Middle click dragging)
         if self.dragging {
             if let Some((last_x, last_y)) = self.drag_last {
                 let dx = (x - last_x) as f32;
@@ -678,6 +757,11 @@ impl Gpu {
                 self.camera.orbit(dx, dy);
             }
             self.drag_last = Some((x, y));
+        }
+
+        // Handle Active Drag Painting (Left click dragging)
+        if self.is_painting {
+            self.update_drag_painting();
         }
     }
 
@@ -709,38 +793,120 @@ impl Gpu {
         (near_world, (far_world - near_world).normalize())
     }
 
-    fn apply_paint(&mut self, x: f64, y: f64) {
-        let (origin, dir) = self.cursor_ray(x, y);
-        let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
+    // Direct voxel modification helper that handles brush bounds, brush size, and mirror settings.
+    fn paint_voxel_at(&mut self, pos: IVec3, val: Voxel) -> bool {
+        let mut changed = false;
+        let size = CHUNK_SIZE as i32;
+        let half_brush = self.brush_size / 2;
 
-        let target: Option<(IVec3, Voxel)> = match self.paint_mode {
-            PaintMode::Add => hit.place_at.and_then(|p| {
-                let size = CHUNK_SIZE as i32;
-                if p.x < 0 || p.y < 0 || p.z < 0 || p.x >= size || p.y >= size || p.z >= size {
-                    None
-                } else {
-                    Some((p, Voxel::new(self.current_material)))
+        // Collect all target coordinates to paint based on Brush Size and Mirroring symmetry
+        let mut targets = Vec::new();
+
+        // 1. Generate local brush offset coordinates
+        for dx in -half_brush..=half_brush {
+            for dy in -half_brush..=half_brush {
+                for dz in -half_brush..=half_brush {
+                    // Spherical brush falloff check
+                    if self.brush_size > 2 && (dx*dx + dy*dy + dz*dz) as f32 > (half_brush as f32 + 0.5).powi(2) {
+                        continue;
+                    }
+                    targets.push(pos + IVec3::new(dx, dy, dz));
                 }
-            }),
-            PaintMode::Replace => Some((hit.voxel, Voxel::new(self.current_material))),
-            PaintMode::Remove => Some((hit.voxel, Voxel::EMPTY)),
-        };
+            }
+        }
 
-        let Some((pos, new_voxel)) = target else { return };
-        let current = self.chunk.get(pos.x as usize, pos.y as usize, pos.z as usize);
-        if current == new_voxel { return; }
+        // 2. Expand targets to include mirror axes symmetry points
+        let mut symmetric_targets = Vec::new();
+        let mid = (CHUNK_SIZE / 2) as i32;
 
-        self.push_undo_snapshot();
-        self.chunk.set(pos.x as usize, pos.y as usize, pos.z as usize, new_voxel);
-        self.rebuild_mesh();
+        for target in &targets {
+            symmetric_targets.push(*target);
+            
+            if self.mirror_x {
+                let sym_x = mid + (mid - target.x) - 1;
+                symmetric_targets.push(IVec3::new(sym_x, target.y, target.z));
+            }
+            if self.mirror_y {
+                let sym_y = mid + (mid - target.y) - 1;
+                symmetric_targets.push(IVec3::new(target.x, sym_y, target.z));
+            }
+            if self.mirror_z {
+                let sym_z = mid + (mid - target.z) - 1;
+                symmetric_targets.push(IVec3::new(target.x, target.y, sym_z));
+            }
+        }
+
+        // 3. Write updates to the Chunk representation
+        for target in symmetric_targets {
+            if target.x >= 0 && target.y >= 0 && target.z >= 0 
+                && target.x < size && target.y < size && target.z < size 
+            {
+                let current = self.chunk.get(target.x as usize, target.y as usize, target.z as usize);
+                if current != val {
+                    self.chunk.set(target.x as usize, target.y as usize, target.z as usize, val);
+                    changed = true;
+                }
+            }
+        }
+
+        changed
     }
 
-    fn try_remove_voxel(&mut self, x: f64, y: f64) {
-        let (origin, dir) = self.cursor_ray(x, y);
-        let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { return };
-        self.push_undo_snapshot();
-        self.chunk.set(hit.voxel.x as usize, hit.voxel.y as usize, hit.voxel.z as usize, Voxel::EMPTY);
-        self.rebuild_mesh();
+    // Evaluates cursor position to paint single frames or interpolate drags.
+    fn update_drag_painting(&mut self) {
+        if !self.is_painting {
+            return;
+        }
+
+        let (origin, dir) = self.cursor_ray(self.cursor_pos.0, self.cursor_pos.1);
+        let Some(hit) = raycast_chunk(&self.chunk, origin, dir) else { 
+            // If the cursor wanders off the canvas, disconnect the stroke trajectory
+            self.last_painted_coords = None;
+            return; 
+        };
+
+        // Determine target grid coordinate depending on brush selection mode
+        let target_pos = match self.paint_mode {
+            PaintMode::Add => {
+                let Some(p) = hit.place_at else { return; };
+                p
+            }
+            PaintMode::Replace | PaintMode::Remove => hit.voxel,
+        };
+
+        let voxel_val = match self.paint_mode {
+            PaintMode::Add | PaintMode::Replace => Voxel::new(self.current_material),
+            PaintMode::Remove => Voxel::EMPTY,
+        };
+
+        let mut changed = false;
+
+        // Execute drawing sequence
+        if let Some(last_pos) = self.last_painted_coords {
+            if last_pos != target_pos {
+                // Dragging occurred: Interpolate between previous position and current target position
+                let interpolated_points = get_3d_line_coords(last_pos, target_pos);
+                for pt in interpolated_points {
+                    if self.paint_voxel_at(pt, voxel_val) {
+                        changed = true;
+                    }
+                }
+            }
+        } else {
+            // First click/new stroke start
+            self.push_undo_snapshot();
+            if self.paint_voxel_at(target_pos, voxel_val) {
+                changed = true;
+            }
+        }
+
+        // Save last visited coordinate context for continuous drag interpolation
+        self.last_painted_coords = Some(target_pos);
+
+        // Rebuild the mesh once per frame if adjustments were committed
+        if changed {
+            self.rebuild_mesh();
+        }
     }
 
     const MAX_HISTORY: usize = 50;
